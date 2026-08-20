@@ -1249,11 +1249,11 @@ def create_app(
             )
         )
         # Idle-session reaper — see idle_session_reaper.py's module docstring
-        # for why it exists and its single-user/no-auth scoping.
+        # for why it exists and its auth-mode scoping.
         idle_reaper_task: asyncio.Task[None] | None = None
-        from omnigent.server.auth import local_single_user_enabled
+        from omnigent.server.idle_session_reaper import reaper_safe_for_auth_mode
 
-        if local_single_user_enabled():
+        if reaper_safe_for_auth_mode():
             from omnigent.server.idle_session_reaper import (
                 make_local_stop_session,
                 reap_idle_sessions_periodically,

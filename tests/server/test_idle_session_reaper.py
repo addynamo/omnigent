@@ -20,7 +20,33 @@ from omnigent.server.idle_session_reaper import (
     _runner_bound_candidates,
     reap_idle_sessions_once,
     reap_idle_sessions_periodically,
+    reaper_safe_for_auth_mode,
 )
+
+
+def test_reaper_safe_for_auth_mode_requires_both_single_user_and_header(monkeypatch) -> None:
+    """``OMNIGENT_LOCAL_SINGLE_USER`` alone is not enough — an operator can
+    (per ``create_auth_provider``'s own docstring) explicitly force
+    accounts/OIDC auth while the single-user marker is also set, in which
+    case an unauthenticated request does NOT succeed as the reserved "local"
+    user and the reaper's cookie-less dispatch would get 401'd. Only the
+    header+single-user combination is actually safe."""
+    monkeypatch.setenv("OMNIGENT_LOCAL_SINGLE_USER", "1")
+    monkeypatch.setenv("OMNIGENT_AUTH_PROVIDER", "header")
+    assert reaper_safe_for_auth_mode() is True
+
+    monkeypatch.setenv("OMNIGENT_AUTH_PROVIDER", "accounts")
+    assert reaper_safe_for_auth_mode() is False
+
+    monkeypatch.setenv("OMNIGENT_AUTH_PROVIDER", "oidc")
+    assert reaper_safe_for_auth_mode() is False
+
+    monkeypatch.setenv("OMNIGENT_AUTH_PROVIDER", "header")
+    monkeypatch.setenv("OMNIGENT_LOCAL_SINGLE_USER", "0")
+    assert reaper_safe_for_auth_mode() is False
+
+    monkeypatch.delenv("OMNIGENT_LOCAL_SINGLE_USER", raising=False)
+    assert reaper_safe_for_auth_mode() is False
 
 
 def test_env_float_rejects_non_finite_values(monkeypatch) -> None:

@@ -10,10 +10,10 @@ and reapable only by hand via ``omnigent host stop-session <id>``. This module
 runs that same stop on a timer for sessions idle past
 :data:`DEFAULT_IDLE_SESSION_TTL_S`.
 
-Deliberately scoped to single-user/no-auth deployments for now (see
-:func:`reap_idle_sessions_once`'s ``local_single_user_enabled`` gate in
-``app.py``'s wiring) — reaping in an accounts-enabled multi-tenant deployment
-needs a real system identity to authorize the stop call, which is future work.
+Deliberately scoped to deployments where an unauthenticated request succeeds as
+the reserved ``"local"`` user for now — see :func:`reaper_safe_for_auth_mode`.
+Reaping in an accounts/OIDC-enabled deployment needs a real system identity to
+authorize the stop call on the target user's behalf, which is future work.
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ from collections.abc import Awaitable, Callable
 import httpx
 
 from omnigent.entities import Conversation
+from omnigent.server.auth import local_single_user_enabled, resolve_auth_source
 from omnigent.stores.conversation_store import ConversationStore
 
 # Matches ``omnigent/server/routes/_sessions/common.py``'s ``_STOP_SESSION_TYPE``.
@@ -52,6 +53,29 @@ DEFAULT_SWEEP_INTERVAL_S = 5 * 60  # 5 minutes
 # should tune ``OMNIGENT_IDLE_REAPER_INTERVAL_S`` down instead of raising
 # this, so a sweep stays cheap.
 _SWEEP_PAGE_LIMIT = 500
+
+
+def reaper_safe_for_auth_mode() -> bool:
+    """Whether an unauthenticated request on this server succeeds as the
+    reserved ``"local"`` user, which is what the reaper's cookie-less
+    in-process ``stop_session`` dispatch (:func:`make_local_stop_session`)
+    depends on.
+
+    ``OMNIGENT_LOCAL_SINGLE_USER`` alone is NOT sufficient: it's an
+    independently-settable marker (``create_auth_provider``'s own docstring:
+    "an explicit OMNIGENT_AUTH_PROVIDER... always wins... and a truthy
+    OMNIGENT_LOCAL_SINGLE_USER declares a single-user server" — these are
+    separate switches an operator can combine). The reserved-user fallback
+    only actually fires inside header-mode's identity check
+    (``UnifiedAuthProvider._check_header``) when the identity header is
+    absent — accounts/OIDC mode always requires a real session cookie
+    regardless of this marker, so an operator running accounts/OIDC auth
+    with ``OMNIGENT_LOCAL_SINGLE_USER=1`` also set would see every reaper
+    stop request rejected with 401 if this only checked the marker. Requiring
+    BOTH the marker AND a resolved ``"header"`` source matches the exact
+    condition under which the reserved-user fallback applies.
+    """
+    return local_single_user_enabled() and resolve_auth_source() == "header"
 
 
 def _env_float(name: str, default: float) -> float:
@@ -259,7 +283,8 @@ def make_local_stop_session(app: object) -> StopSession:
     hop while still exercising every bit of auth/validation logic a real
     client would.
 
-    Single-user/no-auth only for now — see this module's docstring.
+    Only wired up when :func:`reaper_safe_for_auth_mode` is true — see there
+    for why.
     """
 
     async def _stop(session_id: str) -> None:
