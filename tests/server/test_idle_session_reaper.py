@@ -2,17 +2,21 @@
 
 Exercises :func:`reap_idle_sessions_once` against fakes for the conversation
 store, tunnel registry, and stop-session seam — no real DB, no real ASGI app,
-no wall-clock sleeps. :func:`reap_idle_sessions_periodically`'s loop shape is
-already covered by ``publish_server_metrics_periodically``'s own pattern in
-``performance_metrics.py``; these tests focus on the sweep logic itself,
-which is where the actual idle-vs-fresh and runner-liveness decisions live.
+no wall-clock sleeps. Also covers :func:`reap_idle_sessions_periodically`'s
+own differentiating behavior: the per-iteration try/except that keeps one
+failed sweep from permanently killing the loop.
 """
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from dataclasses import dataclass, field
 
-from omnigent.server.idle_session_reaper import reap_idle_sessions_once
+from omnigent.server.idle_session_reaper import (
+    reap_idle_sessions_once,
+    reap_idle_sessions_periodically,
+)
 
 
 @dataclass
@@ -190,3 +194,43 @@ async def test_a_failed_stop_does_not_abort_the_rest_of_the_sweep() -> None:
     # Only the successful stop counts; the failing one is logged, not raised.
     assert reaped == 1
     assert stop.stopped == ["idle-ok"]
+
+
+async def test_periodic_sweep_survives_a_failed_iteration_and_keeps_going() -> None:
+    """A sweep-level failure (e.g. the store raising) must be logged and
+    swallowed by ``reap_idle_sessions_periodically``'s own try/except, not
+    left to kill the background task — the loop should reach a later,
+    successful iteration."""
+    calls = 0
+
+    class RaisingThenSucceedingStore:
+        def list_conversations(self, **kwargs: object) -> _FakePage:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("boom")
+            return _FakePage(data=[])
+
+    tunnels = FakeTunnelRegistry(online_runner_ids=set())
+    stop = StopSessionSpy()
+
+    task = asyncio.create_task(
+        reap_idle_sessions_periodically(
+            conversation_store=RaisingThenSucceedingStore(),
+            tunnel_registry=tunnels,
+            stop_session=stop,
+            ttl_seconds=3600.0,
+            interval_seconds=0,
+        )
+    )
+    try:
+        for _ in range(1000):
+            if calls >= 2:
+                break
+            await asyncio.sleep(0)
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    assert calls >= 2

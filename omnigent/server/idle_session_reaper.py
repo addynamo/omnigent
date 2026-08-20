@@ -36,7 +36,7 @@ _logger = logging.getLogger(__name__)
 
 # How long a session may sit idle (no item append, no title change — anything
 # that bumps ``Conversation.updated_at``) with a live runner before it's
-# reaped. 0 (or unset) disables the reaper entirely.
+# reaped. 0 or negative disables the reaper; unset defaults to this value.
 DEFAULT_IDLE_SESSION_TTL_S = 2 * 60 * 60  # 2 hours
 
 # How often the reaper sweeps for idle sessions.
