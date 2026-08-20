@@ -26,6 +26,7 @@ class _FakeConversation:
     id: str
     updated_at: float
     runner_id: str | None
+    live_status: str | None = None
 
 
 @dataclass
@@ -153,6 +154,43 @@ async def test_skips_sessions_whose_runner_tunnel_is_already_gone() -> None:
 
     assert reaped == 0
     assert stop.stopped == []
+
+
+async def test_skips_sessions_that_are_running_or_waiting_despite_stale_updated_at() -> None:
+    """``live_status`` is the authoritative "turn in progress" signal and is
+    documented to never bump ``updated_at`` — a session mid-turn or parked on
+    a pending elicitation must not be reaped just because ``updated_at`` looks
+    stale."""
+    ttl = 3600.0
+    store = FakeConversationStore(
+        [
+            _FakeConversation(
+                id="running", updated_at=_NOW - ttl - 100, runner_id="r1", live_status="running"
+            ),
+            _FakeConversation(
+                id="waiting", updated_at=_NOW - ttl - 200, runner_id="r2", live_status="waiting"
+            ),
+            _FakeConversation(
+                id="idle", updated_at=_NOW - ttl - 300, runner_id="r3", live_status="idle"
+            ),
+            _FakeConversation(
+                id="never-reported", updated_at=_NOW - ttl - 400, runner_id="r4", live_status=None
+            ),
+        ]
+    )
+    tunnels = FakeTunnelRegistry(online_runner_ids={"r1", "r2", "r3", "r4"})
+    stop = StopSessionSpy()
+
+    reaped = await reap_idle_sessions_once(
+        conversation_store=store,
+        tunnel_registry=tunnels,
+        stop_session=stop,
+        ttl_seconds=ttl,
+        now=_fake_now,
+    )
+
+    assert reaped == 2
+    assert set(stop.stopped) == {"idle", "never-reported"}
 
 
 async def test_disabled_when_ttl_is_non_positive() -> None:

@@ -89,6 +89,13 @@ def _runner_bound_candidates(
     a runner already dead has nothing to reap and isn't this reaper's job to
     explain (its ``runner_online`` will correct itself via ``host status`` on
     the next read).
+
+    Also excludes any conversation whose ``live_status`` is ``"running"`` or
+    ``"waiting"`` — a turn in progress or a session parked on a pending
+    elicitation can leave ``updated_at`` stale well past the TTL, since
+    ``ConversationStore.set_session_live_status`` is documented to never bump
+    ``updated_at``. ``updated_at`` staleness alone is not a reliable idleness
+    signal for those states.
     """
     candidates: list[Conversation] = []
     after: str | None = None
@@ -101,6 +108,8 @@ def _runner_bound_candidates(
             order="asc",
         )
         for conv in page.data:
+            if conv.live_status in ("running", "waiting"):
+                continue
             if conv.runner_id and tunnel_registry.get(conv.runner_id) is not None:  # type: ignore[attr-defined]
                 candidates.append(conv)
         if not page.has_more or not page.data:
