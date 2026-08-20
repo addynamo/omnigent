@@ -220,7 +220,7 @@ async def test_periodic_sweep_survives_a_failed_iteration_and_keeps_going() -> N
             tunnel_registry=tunnels,
             stop_session=stop,
             ttl_seconds=3600.0,
-            interval_seconds=0,
+            interval_seconds=0.0001,
         )
     )
     try:

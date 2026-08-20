@@ -182,6 +182,13 @@ async def reap_idle_sessions_periodically(
     if ttl <= 0:
         _logger.info("idle_session_reaper: disabled (OMNIGENT_IDLE_SESSION_TTL_S <= 0)")
         return
+    if interval <= 0:
+        _logger.warning(
+            "idle_session_reaper: invalid interval_seconds=%s, using default %s",
+            interval,
+            DEFAULT_SWEEP_INTERVAL_S,
+        )
+        interval = DEFAULT_SWEEP_INTERVAL_S
     while True:
         await asyncio.sleep(interval)
         try:
