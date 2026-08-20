@@ -1248,6 +1248,30 @@ def create_app(
                 otel_publisher=server_metrics_otel,
             )
         )
+        # Idle-session reaper: sessions keep their runner resident after the
+        # launching command exits so follow-up turns don't cold-start, but
+        # nothing previously stopped one that was never followed up on —
+        # `omni run`/scheduled-task/Slack-thread sessions accumulated resident
+        # runner + native-bridge processes forever. Scoped to single-user/
+        # no-auth deployments for now: stopping a session on someone else's
+        # behalf needs a real system identity to authorize the call, which an
+        # accounts-enabled multi-tenant deployment doesn't have here yet.
+        idle_reaper_task: asyncio.Task[None] | None = None
+        from omnigent.server.auth import local_single_user_enabled
+
+        if local_single_user_enabled():
+            from omnigent.server.idle_session_reaper import (
+                make_local_stop_session,
+                reap_idle_sessions_periodically,
+            )
+
+            idle_reaper_task = asyncio.create_task(
+                reap_idle_sessions_periodically(
+                    conversation_store=conversation_store,
+                    tunnel_registry=tunnel_registry,
+                    stop_session=make_local_stop_session(app_inst),
+                )
+            )
         # Runner ``runner_last_seen`` is refreshed per-tunnel from each
         # runner tunnel's ping loop (``runner_tunnel._ping_loop``), inside
         # that handler's ``workspace_scope`` — not from a lifespan sweep,
@@ -1317,6 +1341,10 @@ def create_app(
             metrics_publish_task.cancel()
             with suppress(asyncio.CancelledError):
                 await metrics_publish_task
+            if idle_reaper_task is not None:
+                idle_reaper_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await idle_reaper_task
             # Stop in-flight background managed-sandbox launches so a
             # slow provision doesn't outlive the ASGI shutdown (the
             # sandbox itself, if already provisioned, is reaped by the
