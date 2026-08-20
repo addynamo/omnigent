@@ -1248,14 +1248,8 @@ def create_app(
                 otel_publisher=server_metrics_otel,
             )
         )
-        # Idle-session reaper: sessions keep their runner resident after the
-        # launching command exits so follow-up turns don't cold-start, but
-        # nothing previously stopped one that was never followed up on —
-        # `omni run`/scheduled-task/Slack-thread sessions accumulated resident
-        # runner + native-bridge processes forever. Scoped to single-user/
-        # no-auth deployments for now: stopping a session on someone else's
-        # behalf needs a real system identity to authorize the call, which an
-        # accounts-enabled multi-tenant deployment doesn't have here yet.
+        # Idle-session reaper — see idle_session_reaper.py's module docstring
+        # for why it exists and its single-user/no-auth scoping.
         idle_reaper_task: asyncio.Task[None] | None = None
         from omnigent.server.auth import local_single_user_enabled
 

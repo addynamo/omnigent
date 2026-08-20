@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import time
 from collections.abc import Awaitable, Callable
@@ -42,23 +43,38 @@ DEFAULT_IDLE_SESSION_TTL_S = 2 * 60 * 60  # 2 hours
 # How often the reaper sweeps for idle sessions.
 DEFAULT_SWEEP_INTERVAL_S = 5 * 60  # 5 minutes
 
-# How many runner-bound sessions to inspect per sweep. Generous relative to
-# any single-host deployment's expected live-session count; a deployment large
-# enough to need more should tune ``OMNIGENT_IDLE_REAPER_INTERVAL_S`` down
-# instead of raising this, so a sweep stays cheap.
+# How many conversation ROWS (not just runner-bound matches) a single sweep
+# will scan before giving up for this cycle. Bounds the pagination walk itself
+# — without this, a deployment with few live runners but a large conversation
+# history would rescan its entire history every sweep, since filtered-out rows
+# don't otherwise stop the walk. Generous relative to any single-host
+# deployment's expected history size; a deployment large enough to need more
+# should tune ``OMNIGENT_IDLE_REAPER_INTERVAL_S`` down instead of raising
+# this, so a sweep stays cheap.
 _SWEEP_PAGE_LIMIT = 500
 
 
 def _env_float(name: str, default: float) -> float:
-    """Read a float env var, falling back to *default* on unset/invalid."""
+    """Read a float env var, falling back to *default* on unset/invalid.
+
+    Rejects non-finite values (``nan``, ``inf``, ``-inf``) too, not just
+    unparseable ones — ``float()`` happily accepts those strings, and a
+    ``nan`` TTL would make every ``ttl <= 0`` / ``updated_at > cutoff``
+    comparison downstream false, silently reaping every live session on the
+    next sweep instead of disabling the reaper or falling back to a sane
+    default.
+    """
     raw = os.environ.get(name)
     if not raw:
         return default
     try:
-        return float(raw)
+        value = float(raw)
     except ValueError:
+        value = None
+    if value is None or not math.isfinite(value):
         _logger.warning("idle_session_reaper: invalid %s=%r, using default %s", name, raw, default)
         return default
+    return value
 
 
 def idle_session_ttl_seconds() -> float:
@@ -99,14 +115,16 @@ def _runner_bound_candidates(
     """
     candidates: list[Conversation] = []
     after: str | None = None
-    while len(candidates) < _SWEEP_PAGE_LIMIT:
+    inspected = 0
+    while inspected < _SWEEP_PAGE_LIMIT:
         page = conversation_store.list_conversations(
-            limit=min(100, _SWEEP_PAGE_LIMIT - len(candidates)),
+            limit=min(100, _SWEEP_PAGE_LIMIT - inspected),
             after=after,
             kind="default",
             sort_by="updated_at",
             order="asc",
         )
+        inspected += len(page.data)
         for conv in page.data:
             if conv.live_status in ("running", "waiting"):
                 continue
@@ -149,6 +167,21 @@ async def reap_idle_sessions_once(
             # List is oldest-first: once we hit a fresh one, everything after
             # it is fresher still.
             break
+        # Re-validate immediately before stopping: the candidate list was read
+        # once up front, but a user can start a follow-up turn (bumping
+        # updated_at / flipping live_status) at any point before this specific
+        # session's stop is dispatched — especially likely deep into a sweep
+        # with many candidates, or when a stop call is slow. Without this
+        # re-check, a session that went active moments after listing would
+        # still get its runner killed on stale information.
+        fresh = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
+        if fresh is None:
+            continue
+        if fresh.live_status in ("running", "waiting") or fresh.updated_at > cutoff:
+            _logger.debug(
+                "idle_session_reaper: skipping %s — became active since listing", conv.id
+            )
+            continue
         try:
             await stop_session(conv.id)
         except Exception:
@@ -158,7 +191,7 @@ async def reap_idle_sessions_once(
         _logger.info(
             "idle_session_reaper: stopped idle session %s (idle %.0fs, ttl %.0fs)",
             conv.id,
-            now() - conv.updated_at,
+            now() - fresh.updated_at,
             ttl_seconds,
         )
     return reaped

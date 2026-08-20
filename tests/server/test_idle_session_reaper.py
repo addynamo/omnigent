@@ -13,10 +13,31 @@ import asyncio
 import contextlib
 from dataclasses import dataclass, field
 
+import omnigent.server.idle_session_reaper as idle_session_reaper
 from omnigent.server.idle_session_reaper import (
+    DEFAULT_IDLE_SESSION_TTL_S,
+    _env_float,
+    _runner_bound_candidates,
     reap_idle_sessions_once,
     reap_idle_sessions_periodically,
 )
+
+
+def test_env_float_rejects_non_finite_values(monkeypatch) -> None:
+    """``float()`` parses "nan"/"inf"/"-inf" without raising — a nan TTL would
+    make every ``ttl <= 0`` and ``updated_at > cutoff`` comparison downstream
+    false, silently reaping every live session instead of disabling the
+    reaper or falling back to a sane default."""
+    for raw in ("nan", "NaN", "inf", "-inf", "Infinity"):
+        monkeypatch.setenv("OMNIGENT_IDLE_SESSION_TTL_S", raw)
+        assert _env_float("OMNIGENT_IDLE_SESSION_TTL_S", DEFAULT_IDLE_SESSION_TTL_S) == (
+            DEFAULT_IDLE_SESSION_TTL_S
+        )
+
+
+def test_env_float_accepts_normal_values(monkeypatch) -> None:
+    monkeypatch.setenv("OMNIGENT_IDLE_SESSION_TTL_S", "42.5")
+    assert _env_float("OMNIGENT_IDLE_SESSION_TTL_S", DEFAULT_IDLE_SESSION_TTL_S) == 42.5
 
 
 @dataclass
@@ -37,24 +58,46 @@ class _FakePage:
 
 
 class FakeConversationStore:
-    """Single-page stand-in for ``ConversationStore.list_conversations``.
+    """Real-pagination stand-in for ``ConversationStore.list_conversations`` +
+    ``get_conversation``, keyed by id so a test can mutate one entry between
+    the listing pass and the reaper's own pre-stop freshness re-check —
+    exactly the race window the re-check exists to close.
 
-    Real pagination (multi-page sweeps) isn't exercised here — the reaper's
-    paging loop is a thin, standard cursor walk with no idle-specific logic in
-    it, so a single fake page keeps these tests focused on the sweep decision
-    (idle vs. fresh, runner-bound vs. not) rather than re-testing pagination.
+    Honors ``limit``/``after`` like the real store's cursor pagination, so
+    tests can exercise the multi-page walk in ``_runner_bound_candidates``
+    (e.g. confirming it stops after inspecting ``_SWEEP_PAGE_LIMIT`` rows
+    total, not just ``_SWEEP_PAGE_LIMIT`` matches).
     """
 
     def __init__(self, conversations: list[_FakeConversation]) -> None:
-        self._conversations = conversations
+        self._by_id = {c.id: c for c in conversations}
 
-    def list_conversations(self, **kwargs: object) -> _FakePage:
+    def list_conversations(
+        self, *, limit: int = 20, after: str | None = None, **kwargs: object
+    ) -> _FakePage:
         # The reaper always requests sort_by="updated_at", order="asc" (see
         # ``_runner_bound_candidates``) and relies on that ordering to break
         # early once it hits a fresh conversation — sort here the same way a
         # real store would, rather than trusting caller-supplied order.
-        ordered = sorted(self._conversations, key=lambda c: c.updated_at)
-        return _FakePage(data=ordered)
+        ordered = sorted(self._by_id.values(), key=lambda c: c.updated_at)
+        start = 0
+        if after is not None:
+            ids = [c.id for c in ordered]
+            start = ids.index(after) + 1
+        page = ordered[start : start + limit]
+        has_more = start + limit < len(ordered)
+        return _FakePage(data=page, has_more=has_more, last_id=page[-1].id if page else None)
+
+    def get_conversation(self, conversation_id: str) -> _FakeConversation | None:
+        return self._by_id.get(conversation_id)
+
+    def mark_active(self, conversation_id: str, *, now: float) -> None:
+        """Simulate a follow-up turn starting after the listing pass: bumps
+        ``updated_at`` to *now* and flips ``live_status`` to ``"running"``."""
+        conv = self._by_id[conversation_id]
+        self._by_id[conversation_id] = _FakeConversation(
+            id=conv.id, updated_at=now, runner_id=conv.runner_id, live_status="running"
+        )
 
 
 class FakeTunnelRegistry:
@@ -191,6 +234,116 @@ async def test_skips_sessions_that_are_running_or_waiting_despite_stale_updated_
 
     assert reaped == 2
     assert set(stop.stopped) == {"idle", "never-reported"}
+
+
+async def test_sweep_page_limit_bounds_rows_inspected_not_just_matches(monkeypatch) -> None:
+    """``_SWEEP_PAGE_LIMIT`` must bound how many conversation rows a sweep
+    scans, not how many runner-bound matches it finds — otherwise a
+    deployment with few live runners but a large conversation history would
+    rescan its entire history every sweep, since filtered-out (non-runner-
+    bound) rows wouldn't otherwise stop the walk."""
+    monkeypatch.setattr(idle_session_reaper, "_SWEEP_PAGE_LIMIT", 5)
+    # None of these are runner-bound, so zero would ever become candidates —
+    # if the walk were bounded by matches instead of rows inspected, it would
+    # keep paginating through all 12 looking for a match that never comes.
+    real_store = FakeConversationStore(
+        [
+            _FakeConversation(id=f"no-runner-{i}", updated_at=float(i), runner_id=None)
+            for i in range(12)
+        ]
+    )
+    rows_returned = 0
+
+    class _CountingStore:
+        def list_conversations(self, **kwargs: object) -> _FakePage:
+            nonlocal rows_returned
+            page = real_store.list_conversations(**kwargs)
+            rows_returned += len(page.data)
+            return page
+
+    tunnels = FakeTunnelRegistry(online_runner_ids=set())
+
+    candidates = await asyncio.to_thread(
+        _runner_bound_candidates, _CountingStore(), tunnel_registry=tunnels
+    )
+
+    assert candidates == []
+    # The patched limit is 5, not 12 — proves the walk stops on rows
+    # inspected, not on ``len(candidates)`` (which never grows here and so
+    # would never bound the old, buggy implementation's pagination).
+    assert rows_returned == 5
+
+
+async def test_revalidates_freshness_immediately_before_stopping() -> None:
+    """A candidate can go active between the listing pass and its own stop
+    dispatch — e.g. a user starts a follow-up turn while an earlier
+    candidate's stop is still being processed. The pre-stop re-check must
+    catch this and skip it, not kill a runner that's newly active again."""
+    ttl = 3600.0
+    store = FakeConversationStore(
+        [
+            _FakeConversation(id="first", updated_at=_NOW - ttl - 200, runner_id="r1"),
+            _FakeConversation(id="second", updated_at=_NOW - ttl - 100, runner_id="r2"),
+        ]
+    )
+    tunnels = FakeTunnelRegistry(online_runner_ids={"r1", "r2"})
+    stop = StopSessionSpy()
+
+    real_call = stop.__call__
+
+    async def _stop_and_mutate(session_id: str) -> None:
+        await real_call(session_id)
+        if session_id == "first":
+            # Simulate "second" starting a new turn while "first"'s stop was
+            # in flight — this must be observed by the pre-stop re-check for
+            # "second", not just the stale snapshot from the listing pass.
+            store.mark_active("second", now=_NOW)
+
+    reaped = await reap_idle_sessions_once(
+        conversation_store=store,
+        tunnel_registry=tunnels,
+        stop_session=_stop_and_mutate,
+        ttl_seconds=ttl,
+        now=_fake_now,
+    )
+
+    assert reaped == 1
+    assert stop.stopped == ["first"]
+
+
+async def test_skips_candidate_deleted_between_listing_and_stop() -> None:
+    """``get_conversation`` returning ``None`` (row gone) must be a clean
+    skip, not an attribute-error crash on the re-check."""
+    ttl = 3600.0
+    store = FakeConversationStore(
+        [_FakeConversation(id="vanishes", updated_at=_NOW - ttl - 100, runner_id="r1")]
+    )
+
+    class _DeletesAfterListing:
+        """Answers ``list_conversations`` from the real fake, but always
+        reports the row gone on the freshness re-check — the listing pass
+        must still see it (so the candidate loop runs) while the re-check
+        catches its disappearance."""
+
+        def list_conversations(self, **kwargs: object) -> _FakePage:
+            return store.list_conversations(**kwargs)
+
+        def get_conversation(self, conversation_id: str) -> None:
+            return None
+
+    tunnels = FakeTunnelRegistry(online_runner_ids={"r1"})
+    stop = StopSessionSpy()
+
+    reaped = await reap_idle_sessions_once(
+        conversation_store=_DeletesAfterListing(),
+        tunnel_registry=tunnels,
+        stop_session=stop,
+        ttl_seconds=ttl,
+        now=_fake_now,
+    )
+
+    assert reaped == 0
+    assert stop.stopped == []
 
 
 async def test_disabled_when_ttl_is_non_positive() -> None:
