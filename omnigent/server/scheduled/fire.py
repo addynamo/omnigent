@@ -635,13 +635,26 @@ async def _conversation_is_reusable(
       conversation would run the agent against a stale host/workspace
       binding — silently executing in the wrong place rather than honoring
       the task's current configuration.
+    * **Model/reasoning-effort overrides unchanged.** ``conv.model_override``/
+      ``conv.reasoning_effort`` are likewise stamped once, in ``_create_session``
+      (via ``update_conversation`` right after create). If a task is PATCHed
+      with a new ``model_override``/``reasoning_effort`` after its conversation
+      already exists, reusing that conversation would keep dispatching against
+      the OLD values — the task's edited configuration would silently never
+      take effect for a reused conversation, the same class of staleness as
+      the host/workspace case above, just for a different pair of fields.
     """
     running = await asyncio.to_thread(
         deps.scheduled_task_store.get_running_run_by_conversation, conv.id
     )
     if running is not None:
         return False
-    return conv.host_id == effective.host_id and conv.workspace == effective.workspace
+    return (
+        conv.host_id == effective.host_id
+        and conv.workspace == effective.workspace
+        and conv.model_override == effective.model_override
+        and conv.reasoning_effort == effective.reasoning_effort
+    )
 
 
 async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
