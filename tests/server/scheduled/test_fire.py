@@ -42,6 +42,7 @@ class _FakeConversation:
     git_branch: str | None = None
     model_override: str | None = None
     reasoning_effort: str | None = None
+    title: str | None = None
 
 
 @dataclass
@@ -130,6 +131,7 @@ class FakeConversationStore:
         reused_conv_workspace: str | None = "/repo",
         reused_conv_model_override: str | None = None,
         reused_conv_reasoning_effort: str | None = None,
+        reused_conv_title: str | None = "nightly",
     ) -> None:
         self.created: list[dict[str, Any]] = []
         self.create_workspace_ids: list[int] = []
@@ -137,17 +139,19 @@ class FakeConversationStore:
         self.fail_create = fail_create
         # Ids that should behave as deleted — get_conversation() returns None.
         self.missing_ids = missing_ids or set()
-        # host_id/workspace/model_override/reasoning_effort get_conversation()
-        # reports for a REUSE lookup — the real store's row-level truth (not
-        # what create_conversation() would write). Defaults match _task()'s
-        # own host_id="host_1"/workspace="/repo"/model_override=None/
-        # reasoning_effort=None so reuse tests pass config validation without
-        # extra setup; a test can pass a mismatched value to exercise the
-        # stale-config rejection in _conversation_is_reusable.
+        # host_id/workspace/model_override/reasoning_effort/title
+        # get_conversation() reports for a REUSE lookup — the real store's
+        # row-level truth (not what create_conversation() would write).
+        # Defaults match _task()'s own host_id="host_1"/workspace="/repo"/
+        # model_override=None/reasoning_effort=None/name="nightly" so reuse
+        # tests pass config validation without extra setup; a test can pass a
+        # mismatched value to exercise the stale-config rejection in
+        # _conversation_is_reusable.
         self.reused_conv_host_id = reused_conv_host_id
         self.reused_conv_workspace = reused_conv_workspace
         self.reused_conv_model_override = reused_conv_model_override
         self.reused_conv_reasoning_effort = reused_conv_reasoning_effort
+        self.reused_conv_title = reused_conv_title
 
     def create_conversation(self, **kwargs: Any) -> _FakeConversation:
         self.create_workspace_ids.append(current_workspace_id())
@@ -177,6 +181,7 @@ class FakeConversationStore:
             workspace=self.reused_conv_workspace,
             model_override=self.reused_conv_model_override,
             reasoning_effort=self.reused_conv_reasoning_effort,
+            title=self.reused_conv_title,
         )
 
 
@@ -1333,6 +1338,39 @@ async def test_reuse_session_skipped_when_host_or_workspace_has_drifted() -> Non
     assert len(launched) == 1
     assert launched[0].id != "conv_prior"
     assert launched[0].host_id == "host_1"  # bound to the CURRENT effective host
+
+
+@pytest.mark.asyncio
+async def test_reuse_session_skipped_when_title_has_drifted() -> None:
+    """`conv.title` is stamped once from `task.name` at conversation-create
+    time (in _create_session). If the task is renamed via PATCH after its
+    conversation already exists, reusing it would keep displaying the OLD
+    title indefinitely. Falls back to creating a fresh conversation bound to
+    the current name instead, same as the other stale-config drift cases."""
+    conv_store = FakeConversationStore(reused_conv_title="nightly")
+    store = FakeScheduledTaskStore(
+        rows={
+            "task_1": _task(
+                last_run_conversation_id="conv_prior",
+                name="nightly (renamed)",  # patched to a different name
+            )
+        }
+    )
+    launched: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        launched.append(conv)
+
+    on_fire = build_on_fire(
+        _deps(store, conversation_store=conv_store),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert len(conv_store.created) == 1
+    assert len(launched) == 1
+    assert launched[0].id != "conv_prior"
 
 
 @pytest.mark.asyncio

@@ -643,6 +643,10 @@ async def _conversation_is_reusable(
       the OLD values — the task's edited configuration would silently never
       take effect for a reused conversation, the same class of staleness as
       the host/workspace case above, just for a different pair of fields.
+    * **Title unchanged.** ``conv.title`` is likewise stamped once from
+      ``task.name`` at create time. If the task is renamed after its
+      conversation already exists, reusing that conversation would keep
+      displaying the old title indefinitely.
     """
     running = await asyncio.to_thread(
         deps.scheduled_task_store.get_running_run_by_conversation, conv.id
@@ -654,6 +658,7 @@ async def _conversation_is_reusable(
         and conv.workspace == effective.workspace
         and conv.model_override == effective.model_override
         and conv.reasoning_effort == effective.reasoning_effort
+        and conv.title == effective.name
     )
 
 
