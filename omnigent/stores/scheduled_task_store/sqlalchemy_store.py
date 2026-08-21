@@ -60,6 +60,7 @@ def _to_entity(row: SqlScheduledTask) -> ScheduledTask:
         state=decode_scheduled_task_state(row.state),
         last_run_at=row.last_run_at,
         last_run_conversation_id=row.last_run_conversation_id,
+        reuse_session=row.reuse_session,
         updated_at=row.updated_at,
     )
 
@@ -130,6 +131,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         workspace: str | None = None,
         host_id: str | None = None,
         state: str = "active",
+        reuse_session: bool = True,
     ) -> ScheduledTask:
         """Insert a new scheduled task with a required recurring ``rrule``."""
         row = SqlScheduledTask(
@@ -149,6 +151,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             state=encode_scheduled_task_state(state),
             last_run_at=None,
             last_run_conversation_id=None,
+            reuse_session=reuse_session,
             created_at=now_epoch(),
             updated_at=None,
         )
@@ -251,6 +254,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         state: str | None = None,
         last_run_at: int | None = None,
         last_run_conversation_id: str | None = _UNSET,
+        reuse_session: bool | None = None,
     ) -> ScheduledTask | None:
         """Update mutable fields.
 
@@ -301,6 +305,9 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 row.last_run_conversation_id != last_run_conversation_id
             ):
                 row.last_run_conversation_id = last_run_conversation_id
+                changed = True
+            if reuse_session is not None and row.reuse_session != reuse_session:
+                row.reuse_session = reuse_session
                 changed = True
             if changed:
                 row.updated_at = now_epoch()

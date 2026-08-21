@@ -108,11 +108,13 @@ class SequencedScheduledTaskStore(FakeScheduledTaskStore):
 
 
 class FakeConversationStore:
-    def __init__(self, *, fail_create: bool = False) -> None:
+    def __init__(self, *, fail_create: bool = False, missing_ids: set[str] | None = None) -> None:
         self.created: list[dict[str, Any]] = []
         self.create_workspace_ids: list[int] = []
         self._seq = 0
         self.fail_create = fail_create
+        # Ids that should behave as deleted — get_conversation() returns None.
+        self.missing_ids = missing_ids or set()
 
     def create_conversation(self, **kwargs: Any) -> _FakeConversation:
         self.create_workspace_ids.append(current_workspace_id())
@@ -133,6 +135,8 @@ class FakeConversationStore:
         return _FakeConversation(id=conversation_id, agent_id="")
 
     def get_conversation(self, conversation_id: str) -> _FakeConversation | None:
+        if conversation_id in self.missing_ids:
+            return None
         return _FakeConversation(id=conversation_id, agent_id="ag_1")
 
 
@@ -1082,3 +1086,150 @@ async def test_run_now_skips_when_already_in_flight() -> None:
     release.set()
     await _drain()
     assert len(store.runs) == 1
+
+
+# ── Session reuse (reuse_session) ────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_reuse_session_reuses_existing_conversation_when_runner_offline() -> None:
+    """A firing with reuse_session=True (default) and a live
+    last_run_conversation_id reuses that conversation instead of creating a
+    new one. No runner is live in this test (no global runner client set,
+    no runner_router), so this exercises the fallback-to-relaunch branch of
+    _dispatch_reused_or_relaunch — the injected launch seam still fires, but
+    against the REUSED conversation id, and no new conversation is created."""
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(last_run_conversation_id="conv_prior")})
+    launched: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        launched.append(conv)
+
+    on_fire = build_on_fire(
+        _deps(store, conversation_store=conv_store),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert conv_store.created == []  # no new conversation created
+    assert len(launched) == 1
+    assert launched[0].id == "conv_prior"
+    assert len(store.runs) == 1
+    assert store.runs[0]["conversation_id"] == "conv_prior"
+
+
+@pytest.mark.asyncio
+async def test_reuse_session_dispatches_directly_when_runner_already_connected() -> None:
+    """When the reused conversation's runner is already live, the fast path
+    dispatches directly via _get_runner_client/_dispatch_session_event_to_runner
+    and never calls the injected launch seam (which would mint a redundant
+    second runner via _launch_runner_on_host)."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(last_run_conversation_id="conv_prior")})
+    launched: list[Any] = []
+    dispatched: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        launched.append(conv)
+
+    async def _fake_get_runner_client(session_id: str, runner_router: Any, **kwargs: Any) -> Any:
+        return object()  # any non-None sentinel signals "already connected"
+
+    async def _fake_ensure_initialized(*args: Any, **kwargs: Any) -> bool:
+        return False
+
+    async def _fake_dispatch_event(session_id: str, conv: Any, *args: Any, **kwargs: Any) -> Any:
+        dispatched.append(conv)
+        return None
+
+    import omnigent.server.scheduled.fire as fire_module
+
+    monkeypatch_targets = [
+        (sessions_module, "_get_runner_client", _fake_get_runner_client),
+        (sessions_module, "_ensure_runner_session_initialized", _fake_ensure_initialized),
+        (sessions_module, "_dispatch_session_event_to_runner", _fake_dispatch_event),
+    ]
+    originals = [(mod, name, getattr(mod, name)) for mod, name, _ in monkeypatch_targets]
+    for mod, name, fake in monkeypatch_targets:
+        setattr(mod, name, fake)
+    try:
+        on_fire = build_on_fire(
+            _deps(store, conversation_store=conv_store),
+            launch_dispatch=_launch,
+        )
+        await on_fire(0, "task_1")
+        await _drain()
+    finally:
+        for mod, name, original in originals:
+            setattr(mod, name, original)
+
+    assert conv_store.created == []
+    assert launched == []  # relaunch seam never invoked — already connected
+    assert len(dispatched) == 1
+    assert dispatched[0].id == "conv_prior"
+    assert len(store.runs) == 1
+    assert store.runs[0]["conversation_id"] == "conv_prior"
+    del fire_module  # imported only to make the patch target obvious; unused directly
+
+
+@pytest.mark.asyncio
+async def test_reuse_session_falls_back_to_create_when_prior_conversation_deleted() -> None:
+    """last_run_conversation_id set, but the row is gone (deleted since the
+    last fire) — falls back to creating a new conversation exactly like the
+    never-fired case, not a failed run."""
+    conv_store = FakeConversationStore(missing_ids={"conv_deleted"})
+    perm = FakePermissionStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(last_run_conversation_id="conv_deleted")})
+    launched: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        launched.append(conv)
+
+    on_fire = build_on_fire(
+        _deps(store, conversation_store=conv_store, permission_store=perm),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert len(conv_store.created) == 1  # fell back to creating a new one
+    assert len(launched) == 1
+    assert launched[0].id != "conv_deleted"
+    # New conversation still gets the owner grant, same as any first fire.
+    assert perm.grants and perm.grants[0][1] == launched[0].id
+
+
+@pytest.mark.asyncio
+async def test_reuse_session_false_always_creates_new_conversation() -> None:
+    """reuse_session=False (opt-out) always creates a new conversation, even
+    with a live last_run_conversation_id — restores the original
+    always-new-session behavior for tasks that want a fresh context every
+    firing."""
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(
+        rows={
+            "task_1": _task(
+                last_run_conversation_id="conv_prior",
+                reuse_session=False,
+            )
+        }
+    )
+    launched: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        launched.append(conv)
+
+    on_fire = build_on_fire(
+        _deps(store, conversation_store=conv_store),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert len(conv_store.created) == 1
+    assert len(launched) == 1
+    assert launched[0].id != "conv_prior"

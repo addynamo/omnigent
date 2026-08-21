@@ -1418,10 +1418,14 @@ class SqlScheduledTask(OmnigentBase):
         row↔entity boundary. Defaults to ``active``.
     :param last_run_at: Unix epoch seconds of the most recent firing, or
         ``None`` if it has never fired.
-    :param last_run_conversation_id: The conversation created by the most recent
-        firing (relates to ``conversations.id``). ``None`` if never fired or the
-        referenced conversation was deleted (application-owned SET-NULL cleanup;
-        no DB foreign key).
+    :param last_run_conversation_id: The conversation created (or reused, when
+        ``reuse_session``) by the most recent firing (relates to
+        ``conversations.id``). ``None`` if never fired or the referenced
+        conversation was deleted (application-owned SET-NULL cleanup; no DB
+        foreign key).
+    :param reuse_session: When true (default), a firing with a live
+        ``last_run_conversation_id`` reuses that conversation instead of
+        creating a new one. Defaults true so existing rows opt into reuse too.
     :param created_at: Unix epoch seconds at row creation.
     :param updated_at: Unix epoch seconds of the last write, or ``None`` if the
         row has never been updated.
@@ -1481,6 +1485,7 @@ class SqlScheduledTask(OmnigentBase):
     # Relates to conversations.id. No DB foreign key (Rule R032); the
     # application nulls this out when the referenced conversation is deleted.
     last_run_conversation_id: Mapped[str | None] = mapped_column(Uuid16, nullable=True)
+    reuse_session: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=true())
     created_at: Mapped[int] = mapped_column(Integer)
     updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
 

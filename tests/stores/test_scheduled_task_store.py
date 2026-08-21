@@ -94,6 +94,47 @@ def test_create_minimal_defaults(store: SqlAlchemyScheduledTaskStore) -> None:
     assert task.execution_target == "connected_host"
     assert task.host_id is None
     assert task.state == "active"
+    assert task.reuse_session is True
+
+
+# ── reuse_session ────────────────────────────────────────────────────────────
+
+
+def test_reuse_session_defaults_true_and_can_be_set_or_updated(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """``reuse_session`` defaults true on create, can be created false, and is
+    updatable in either direction — ``None`` on update leaves it unchanged."""
+    default_task = store.create(
+        scheduled_task_id=_uid("st_reuse_default"),
+        name="n",
+        prompt="p",
+        rrule="FREQ=MINUTELY",
+        user_id="u",
+        agent_id=_uid("ag"),
+        timezone="UTC",
+    )
+    assert default_task.reuse_session is True
+
+    opted_out = store.create(
+        scheduled_task_id=_uid("st_reuse_off"),
+        name="n",
+        prompt="p",
+        rrule="FREQ=MINUTELY",
+        user_id="u",
+        agent_id=_uid("ag"),
+        timezone="UTC",
+        reuse_session=False,
+    )
+    assert opted_out.reuse_session is False
+
+    flipped = store.update(_uid("st_reuse_off"), reuse_session=True)
+    assert flipped is not None
+    assert flipped.reuse_session is True
+
+    unchanged = store.update(_uid("st_reuse_off"), name="renamed")
+    assert unchanged is not None
+    assert unchanged.reuse_session is True  # None (not passed) left it alone
 
 
 # ── state enum ────────────────────────────────────────────────────────────────
