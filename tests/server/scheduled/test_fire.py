@@ -60,13 +60,21 @@ class FakeAgentStore:
 class FakeScheduledTaskStore:
     """Records update/create_run calls and serves get() from a dict."""
 
-    def __init__(self, rows: dict[str, ScheduledTask] | None = None) -> None:
+    def __init__(
+        self,
+        rows: dict[str, ScheduledTask] | None = None,
+        *,
+        running_run_by_conversation: dict[str, Any] | None = None,
+    ) -> None:
         self._rows = rows or {}
         self.updates: list[dict[str, Any]] = []
         self.runs: list[dict[str, Any]] = []
         self.get_workspace_ids: list[int] = []
         self.update_workspace_ids: list[int] = []
         self.run_workspace_ids: list[int] = []
+        # conversation_id -> sentinel "running run" object, for
+        # get_running_run_by_conversation. Empty = no conversation has one.
+        self.running_run_by_conversation = running_run_by_conversation or {}
 
     def get(self, scheduled_task_id: str) -> ScheduledTask | None:
         self.get_workspace_ids.append(current_workspace_id())
@@ -92,6 +100,9 @@ class FakeScheduledTaskStore:
         )
         return None
 
+    def get_running_run_by_conversation(self, conversation_id: str) -> Any:
+        return self.running_run_by_conversation.get(conversation_id)
+
 
 class SequencedScheduledTaskStore(FakeScheduledTaskStore):
     """Returns scripted rows for consecutive get() calls."""
@@ -108,13 +119,28 @@ class SequencedScheduledTaskStore(FakeScheduledTaskStore):
 
 
 class FakeConversationStore:
-    def __init__(self, *, fail_create: bool = False, missing_ids: set[str] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        fail_create: bool = False,
+        missing_ids: set[str] | None = None,
+        reused_conv_host_id: str | None = "host_1",
+        reused_conv_workspace: str | None = "/repo",
+    ) -> None:
         self.created: list[dict[str, Any]] = []
         self.create_workspace_ids: list[int] = []
         self._seq = 0
         self.fail_create = fail_create
         # Ids that should behave as deleted — get_conversation() returns None.
         self.missing_ids = missing_ids or set()
+        # host_id/workspace get_conversation() reports for a REUSE lookup — the
+        # real store's row-level truth (not what create_conversation() would
+        # write). Defaults match _task()'s own host_id="host_1"/workspace=
+        # "/repo" so reuse tests pass config validation without extra setup;
+        # a test can pass a mismatched value to exercise the stale-config
+        # rejection in _conversation_is_reusable.
+        self.reused_conv_host_id = reused_conv_host_id
+        self.reused_conv_workspace = reused_conv_workspace
 
     def create_conversation(self, **kwargs: Any) -> _FakeConversation:
         self.create_workspace_ids.append(current_workspace_id())
@@ -137,7 +163,12 @@ class FakeConversationStore:
     def get_conversation(self, conversation_id: str) -> _FakeConversation | None:
         if conversation_id in self.missing_ids:
             return None
-        return _FakeConversation(id=conversation_id, agent_id="ag_1")
+        return _FakeConversation(
+            id=conversation_id,
+            agent_id="ag_1",
+            host_id=self.reused_conv_host_id,
+            workspace=self.reused_conv_workspace,
+        )
 
 
 class FakePermissionStore:
@@ -1233,3 +1264,63 @@ async def test_reuse_session_false_always_creates_new_conversation() -> None:
     assert len(conv_store.created) == 1
     assert len(launched) == 1
     assert launched[0].id != "conv_prior"
+
+
+@pytest.mark.asyncio
+async def test_reuse_session_skipped_when_a_run_is_already_in_flight_for_it() -> None:
+    """A conversation with a still-``running`` run (per
+    get_running_run_by_conversation) must not be reused — dispatching a second
+    message into it would violate the store's one-running-run-per-conversation
+    invariant that the event-driven completion hook depends on. Falls back to
+    creating a fresh conversation instead, same as a deleted prior conversation."""
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(
+        rows={"task_1": _task(last_run_conversation_id="conv_prior")},
+        running_run_by_conversation={"conv_prior": object()},
+    )
+    launched: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        launched.append(conv)
+
+    on_fire = build_on_fire(
+        _deps(store, conversation_store=conv_store),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert len(conv_store.created) == 1  # fell back to a new conversation
+    assert len(launched) == 1
+    assert launched[0].id != "conv_prior"
+
+
+@pytest.mark.asyncio
+async def test_reuse_session_skipped_when_host_or_workspace_has_drifted() -> None:
+    """A reused conversation's stored host_id/workspace must match the
+    EFFECTIVE (current) task config. If the task was edited since the
+    conversation was created — or an unpinned task resolves to a different
+    live host this fire — reusing the stale conversation would run against
+    the wrong host/workspace. Falls back to creating a fresh conversation
+    bound to the current config instead."""
+    # _task()'s defaults are host_id="host_1"/workspace="/repo"; the fake
+    # conversation store reports a DIFFERENT host_id for the prior run's
+    # conversation, simulating drift since it was created.
+    conv_store = FakeConversationStore(reused_conv_host_id="host_2", reused_conv_workspace="/repo")
+    store = FakeScheduledTaskStore(rows={"task_1": _task(last_run_conversation_id="conv_prior")})
+    launched: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        launched.append(conv)
+
+    on_fire = build_on_fire(
+        _deps(store, conversation_store=conv_store),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert len(conv_store.created) == 1
+    assert len(launched) == 1
+    assert launched[0].id != "conv_prior"
+    assert launched[0].host_id == "host_1"  # bound to the CURRENT effective host
