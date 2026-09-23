@@ -410,42 +410,62 @@ async def _run_fire_for_task(
             )
             return
 
-        try:
-            conv = await _create_session(deps, effective)
-        except Exception:
-            _logger.exception("scheduled fire: failed to create session for task %s", task.id)
-            await _record_run(
-                deps,
-                task,
-                None,
-                scheduled_at,
-                status="failed",
-                error="session creation failed",
-                error_code="session_create_failed",
+        reused_conv: Conversation | None = None
+        if effective.reuse_session and effective.last_run_conversation_id is not None:
+            reused_conv = await asyncio.to_thread(
+                deps.conversation_store.get_conversation,
+                effective.last_run_conversation_id,
             )
-            return
+            # A conversation deleted since the last fire is not reusable —
+            # fall through to _create_session below exactly like the
+            # never-fired (last_run_conversation_id is None) case.
+            if reused_conv is not None and not await _conversation_is_reusable(
+                deps, reused_conv, effective
+            ):
+                reused_conv = None
+
+        if reused_conv is not None:
+            conv = reused_conv
+        else:
+            try:
+                conv = await _create_session(deps, effective)
+            except Exception:
+                _logger.exception("scheduled fire: failed to create session for task %s", task.id)
+                await _record_run(
+                    deps,
+                    task,
+                    None,
+                    scheduled_at,
+                    status="failed",
+                    error="session creation failed",
+                    error_code="session_create_failed",
+                )
+                return
+
+            try:
+                await _grant_owner(deps, task, conv.id)
+            except Exception:
+                _logger.exception(
+                    "scheduled fire: owner grant failed for task %s (session %s)",
+                    task.id,
+                    conv.id,
+                )
+                await _record_run(
+                    deps,
+                    task,
+                    conv.id,
+                    scheduled_at,
+                    status="failed",
+                    error="owner grant failed",
+                    error_code="owner_grant_failed",
+                )
+                return
 
         try:
-            await _grant_owner(deps, task, conv.id)
-        except Exception:
-            _logger.exception(
-                "scheduled fire: owner grant failed for task %s (session %s)",
-                task.id,
-                conv.id,
-            )
-            await _record_run(
-                deps,
-                task,
-                conv.id,
-                scheduled_at,
-                status="failed",
-                error="owner grant failed",
-                error_code="owner_grant_failed",
-            )
-            return
-
-        try:
-            await dispatch(conv, effective)
+            if reused_conv is not None:
+                await _dispatch_reused_or_relaunch(deps, reused_conv, effective, dispatch)
+            else:
+                await dispatch(conv, effective)
         except Exception:
             # The session + grant are already persisted and owner-visible, so a
             # launch/dispatch failure still records a run — just a failed one.
@@ -583,6 +603,65 @@ async def _resolve_default_workspace(deps: FireDeps, host_id: str) -> str:
     return canonical
 
 
+async def _conversation_is_reusable(
+    deps: FireDeps, conv: Conversation, effective: ScheduledTask
+) -> bool:
+    """Whether *conv* is safe to reuse for this fire, not just present.
+
+    Two conditions beyond "the row exists" (found via code review on PR #5 —
+    a conversation surviving unconditional-new-session-per-fire never needed
+    either check before reuse existed):
+
+    * **No run still in flight.** The in-flight-fire guard (``_IN_FLIGHT_TASKS``
+      in ``_trigger_fire``) only covers *this task* dispatching a *new* fire
+      concurrently with itself — it clears as soon as ``_run_fire_for_task``
+      returns, which happens once the prompt is dispatched, not once the
+      agent's turn actually finishes. A long-running turn, or a manual
+      ``run-now`` racing a scheduled fire, can therefore still be "running"
+      against this conversation when a later fire wants to reuse it.
+      ``get_running_run_by_conversation`` is the store's own existing
+      one-running-run-per-conversation invariant (documented on that method:
+      "A conversation has at most one running run, so ``.first()`` is exact
+      rather than lossy" — the event-driven completion hook that marks a run
+      succeeded/failed depends on this being true). Dispatching a second
+      message into a conversation that already has a running run would
+      violate that invariant and let the completion hook misattribute a
+      turn's outcome to the wrong run. Skip reuse rather than risk that;
+      falling back to a fresh conversation is always safe.
+    * **Launch configuration unchanged.** ``conv.host_id``/``conv.workspace``
+      are fixed at conversation-create time. If the task was edited (PATCH)
+      since the conversation was created, or an unpinned task resolves to a
+      *different* live host on this particular fire, reusing the old
+      conversation would run the agent against a stale host/workspace
+      binding — silently executing in the wrong place rather than honoring
+      the task's current configuration.
+    * **Model/reasoning-effort overrides unchanged.** ``conv.model_override``/
+      ``conv.reasoning_effort`` are likewise stamped once, in ``_create_session``
+      (via ``update_conversation`` right after create). If a task is PATCHed
+      with a new ``model_override``/``reasoning_effort`` after its conversation
+      already exists, reusing that conversation would keep dispatching against
+      the OLD values — the task's edited configuration would silently never
+      take effect for a reused conversation, the same class of staleness as
+      the host/workspace case above, just for a different pair of fields.
+    * **Title unchanged.** ``conv.title`` is likewise stamped once from
+      ``task.name`` at create time. If the task is renamed after its
+      conversation already exists, reusing that conversation would keep
+      displaying the old title indefinitely.
+    """
+    running = await asyncio.to_thread(
+        deps.scheduled_task_store.get_running_run_by_conversation, conv.id
+    )
+    if running is not None:
+        return False
+    return (
+        conv.host_id == effective.host_id
+        and conv.workspace == effective.workspace
+        and conv.model_override == effective.model_override
+        and conv.reasoning_effort == effective.reasoning_effort
+        and conv.title == effective.name
+    )
+
+
 async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
     """Create a conversation bound to the task's agent, carrying the stored spec."""
     # Connected-host, existing-workspace runs create the conversation directly.
@@ -605,6 +684,51 @@ async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
         if updated is not None:
             conv = updated
     return conv
+
+
+async def _dispatch_reused_or_relaunch(
+    deps: FireDeps,
+    conv: Conversation,
+    task: ScheduledTask,
+    dispatch: LaunchDispatch,
+) -> None:
+    """Dispatch a reused conversation's prompt, relaunching its runner only if needed.
+
+    A reused conversation's runner may already be live (fast path — common
+    when the task fires more often than the idle-session reaper's TTL) or
+    offline (the reaper already stopped it, or the host restarted). Checking
+    first avoids ``dispatch``'s unconditional launch (via
+    ``_launch_runner_on_host``, which always mints a *new* runner_id) minting
+    a redundant second runner alongside one that's already connected and
+    idle. When no runner is live, falls back to *dispatch* unchanged — the
+    same relaunch-via-host sequence a newly created session already uses, and
+    exactly what a user's next message to an idle/offline session triggers in
+    the normal web UI path (``post_event``'s relaunch branch).
+    """
+    from omnigent.server.routes.sessions import (
+        _dispatch_session_event_to_runner,
+        _ensure_runner_session_initialized,
+        _get_runner_client,
+    )
+
+    runner_client = await _get_runner_client(conv.id, deps.runner_router, conversation=conv)
+    if runner_client is None:
+        await dispatch(conv, task)
+        return
+
+    await _ensure_runner_session_initialized(conv.id, conv, runner_client, deps.conversation_store)
+    await _dispatch_session_event_to_runner(
+        conv.id,
+        conv,
+        _prompt_event(task.prompt),
+        deps.conversation_store,
+        runner_client,
+        agent_name=None,
+        file_store=deps.file_store,
+        artifact_store=deps.artifact_store,
+        created_by=task.user_id or RESERVED_USER_LOCAL,
+        runner_router=deps.runner_router,
+    )
 
 
 async def _grant_owner(deps: FireDeps, task: ScheduledTask, conversation_id: str) -> None:

@@ -61,6 +61,11 @@ class CreateScheduledTaskRequest(BaseModel):
     # ``UpdateScheduledTaskRequest``).
     workspace: str | None = Field(default=None, min_length=1)
     host_id: str | None = Field(default=None, min_length=1)
+    # Default true: a firing with a live last_run_conversation_id reuses that
+    # conversation (relaunching its runner if needed) instead of always
+    # creating a new one. False restores the original always-new-session
+    # behavior for tasks that want a fresh context every firing.
+    reuse_session: bool = True
 
 
 class UpdateScheduledTaskRequest(BaseModel):
@@ -77,6 +82,9 @@ class UpdateScheduledTaskRequest(BaseModel):
     workspace: str | None = Field(default=None, min_length=1)
     host_id: str | None = Field(default=None, min_length=1)
     state: str | None = None
+    # None = unchanged (the column itself is never nullable, so unlike
+    # workspace/host_id there's no separate "clear" sentinel to reserve).
+    reuse_session: bool | None = None
 
     @model_validator(mode="after")
     def _validate_patch(self) -> UpdateScheduledTaskRequest:
@@ -127,6 +135,7 @@ def _to_response(
         "last_run_at": task.last_run_at,
         "last_run_status": last_run_status,
         "last_run_conversation_id": task.last_run_conversation_id,
+        "reuse_session": task.reuse_session,
         "next_run_at": next_run_at,
         "updated_at": task.updated_at,
     }
@@ -313,6 +322,7 @@ def create_scheduled_tasks_router(
             reasoning_effort=reasoning_effort,
             workspace=workspace,
             host_id=body.host_id,
+            reuse_session=body.reuse_session,
         )
         scheduler = _scheduler(request)
         if scheduler is not None:

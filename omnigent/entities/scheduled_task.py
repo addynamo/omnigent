@@ -57,8 +57,15 @@ class ScheduledTask:
         ``"deleted"``. Defaults to ``"active"``.
     :param last_run_at: Unix epoch seconds of the most recent firing, or
         ``None`` if it has never fired.
-    :param last_run_conversation_id: Conversation created by the most recent
-        firing, or ``None``.
+    :param last_run_conversation_id: Conversation created (or reused, when
+        ``reuse_session``) by the most recent firing, or ``None``.
+    :param reuse_session: When ``True`` (default), a firing with a live
+        ``last_run_conversation_id`` reuses that conversation — relaunching its
+        runner via the same wake/relaunch path a user's message to an idle
+        session already uses — instead of creating a new one. Falls back to
+        creating a new conversation if the prior one was deleted or its runner
+        can't be woken. ``False`` restores the original always-new-session
+        behavior for tasks that want a fresh context every firing.
     :param updated_at: Unix epoch seconds of the last write, or ``None`` if the
         row has never been updated.
     """
@@ -81,6 +88,7 @@ class ScheduledTask:
     state: str = "active"
     last_run_at: int | None = None
     last_run_conversation_id: str | None = None
+    reuse_session: bool = True
     updated_at: int | None = None
 
 
