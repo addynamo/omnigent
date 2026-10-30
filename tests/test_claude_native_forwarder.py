@@ -8102,6 +8102,122 @@ def test_is_subagent_delivery_not_confirmed_classifier() -> None:
     assert forwarder._is_subagent_delivery_not_confirmed(httpx.ConnectError("boom")) is False
 
 
+def _server_wrapped_not_confirmed_error(reason: str) -> httpx.HTTPStatusError:
+    """Build the 503 Omnigent's server returns after the runner rejects delivery."""
+    runner_body = json.dumps({"error": "subagent_delivery_not_confirmed", "reason": reason})
+    return _http_status_error(
+        503,
+        {
+            "error": {
+                "code": "runner_unavailable",
+                "message": (
+                    "Runner rejected external_session_status 'failed' for sub-agent "
+                    f"session 'conv_x' with status 503: {runner_body}"
+                ),
+            }
+        },
+    )
+
+
+def test_is_subagent_delivery_not_confirmed_matches_server_wrapped_503() -> None:
+    exc = _server_wrapped_not_confirmed_error("missing_work_entry")
+    assert forwarder._is_subagent_delivery_not_confirmed(exc) is True
+
+
+def test_retry_backoff_never_overflows_with_huge_attempt_count() -> None:
+    tracker = forwarder._PostRetryTracker(base_delay_s=1.0, max_delay_s=30.0)
+    exc = _http_status_error(503, {"error": "internal_error"})
+    tracker.record_failure("k", exc)
+    tracker._entries["k"].attempts = 100_000
+    decision = tracker.record_failure("k", exc)
+    assert decision.delay_s == 30.0
+    assert decision.exhausted is False
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        _http_status_error(404, {"error": {"code": "not_found", "message": "gone"}}),
+        _server_wrapped_not_confirmed_error("missing_parent_inbox"),
+        _http_status_error(
+            503, {"error": "subagent_delivery_not_confirmed", "reason": "missing_parent_inbox"}
+        ),
+    ],
+)
+def test_own_session_tracker_raises_session_gone_on_first_permanent_failure(
+    exc: httpx.HTTPStatusError,
+) -> None:
+    tracker = forwarder._PostRetryTracker(stop_on_session_gone=True)
+    with pytest.raises(forwarder._ForwarderSessionGoneError):
+        tracker.record_failure("k", exc)
+
+
+def test_subagent_tracker_keeps_bounded_retry_on_session_gone_failure() -> None:
+    # Child-session trackers must not stop the parent's forwarder.
+    tracker = forwarder._PostRetryTracker()
+    exc = _http_status_error(404, {"error": {"code": "not_found", "message": "gone"}})
+    assert tracker.record_failure("k", exc).exhausted is False
+
+
+@pytest.mark.asyncio
+async def test_supervisor_stops_forwarder_once_when_parent_inbox_is_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A child whose parent inbox is gone stops forwarding instead of retrying forever.
+
+    The server re-wraps the runner's ``subagent_delivery_not_confirmed`` 503,
+    so every terminal status post fails the same way. The forwarder must give
+    up after the first such failure and log it once, without a traceback.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    _record_session_start(bridge_dir, transcript_path)
+    record_hook_event(
+        bridge_dir,
+        {"hook_event_name": "StopFailure", "session_id": "claude-session"},
+    )
+    status_posts: list[str] = []
+
+    async def _always_parent_inbox_missing(*_: Any, **kwargs: Any) -> None:
+        status_posts.append(kwargs["status"])
+        raise _server_wrapped_not_confirmed_error("missing_parent_inbox")
+
+    async def _no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(forwarder, "post_external_session_status", _always_parent_inbox_missing)
+    monkeypatch.setattr(forwarder, "_supervisor_sleep", _no_sleep)
+    server, thread, base_url = _start_recording_server()
+    try:
+        with caplog.at_level(logging.WARNING, logger=forwarder.__name__):
+            await asyncio.wait_for(
+                forwarder.supervise_forwarder(
+                    base_url=base_url,
+                    headers={},
+                    session_id="conv_child",
+                    bridge_dir=bridge_dir,
+                    agent_name="claude-native-ui",
+                    start_at_end=False,
+                    poll_interval_s=0.01,
+                ),
+                timeout=5.0,
+            )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5.0)
+
+    assert status_posts == ["failed"]
+    forwarder_records = [r for r in caplog.records if r.name == forwarder.__name__]
+    assert [r.levelno for r in forwarder_records] == [logging.WARNING]
+    assert "missing_parent_inbox" in forwarder_records[0].getMessage()
+    assert forwarder_records[0].exc_info is None
+
+
 @pytest.mark.asyncio
 async def test_forward_loop_deadline_unsticks_a_stalled_iteration(
     tmp_path: Path,
