@@ -107,7 +107,6 @@ _SUBAGENT_DELIVERY_NOT_CONFIRMED_MAX_ATTEMPTS = 12
 # Caps the backoff exponent so ``2 ** attempts`` cannot overflow a float.
 _HTTP_POST_RETRY_MAX_EXPONENT = 16
 _SUBAGENT_DELIVERY_NOT_CONFIRMED_ERROR = "subagent_delivery_not_confirmed"
-_SUBAGENT_DELIVERY_MISSING_PARENT_INBOX = "missing_parent_inbox"
 _SUPERVISOR_INITIAL_BACKOFF_S = 1.0
 _SUPERVISOR_MAX_BACKOFF_S = 30.0
 _SUPERVISOR_HEALTHY_UPTIME_S = 60.0
@@ -621,8 +620,8 @@ class _ForwarderSessionGoneError(Exception):
     """
     Raised when Omnigent permanently refuses posts for the forwarder's session.
 
-    The session was deleted (404), or it is a sub-agent whose parent inbox is
-    gone, so no retry can succeed. :func:`supervise_forwarder` stops on it.
+    The session was deleted (404), so no retry can succeed.
+    :func:`supervise_forwarder` stops on it.
 
     :param reason: Short description for the log, e.g. ``"http 404"``.
     """
@@ -4770,19 +4769,14 @@ def _session_gone_reason(exc: httpx.HTTPError) -> str | None:
     """
     Return why posts to this session can never succeed, if they cannot.
 
+    A missing parent inbox is not terminal: the runner can restore it, so
+    that 503 stays on the bounded ``subagent_delivery_not_confirmed`` retry.
+
     :param exc: HTTP exception raised while posting an Omnigent event.
-    :returns: ``"http 404"`` for a missing session,
-        ``"missing_parent_inbox"`` for a sub-agent whose parent inbox is
-        gone, otherwise ``None``.
+    :returns: ``"http 404"`` for a missing session, otherwise ``None``.
     """
-    if not isinstance(exc, httpx.HTTPStatusError):
-        return None
-    if exc.response.status_code == 404:
+    if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 404:
         return "http 404"
-    if _is_subagent_delivery_not_confirmed(exc) and (
-        _SUBAGENT_DELIVERY_MISSING_PARENT_INBOX in exc.response.text
-    ):
-        return _SUBAGENT_DELIVERY_MISSING_PARENT_INBOX
     return None
 
 

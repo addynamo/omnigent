@@ -8134,22 +8134,20 @@ def test_retry_backoff_never_overflows_with_huge_attempt_count() -> None:
     assert decision.exhausted is False
 
 
-@pytest.mark.parametrize(
-    "exc",
-    [
-        _http_status_error(404, {"error": {"code": "not_found", "message": "gone"}}),
-        _server_wrapped_not_confirmed_error("missing_parent_inbox"),
-        _http_status_error(
-            503, {"error": "subagent_delivery_not_confirmed", "reason": "missing_parent_inbox"}
-        ),
-    ],
-)
-def test_own_session_tracker_raises_session_gone_on_first_permanent_failure(
-    exc: httpx.HTTPStatusError,
-) -> None:
+def test_own_session_tracker_raises_session_gone_on_missing_session_404() -> None:
     tracker = forwarder._PostRetryTracker(stop_on_session_gone=True)
+    exc = _http_status_error(404, {"error": {"code": "not_found", "message": "gone"}})
     with pytest.raises(forwarder._ForwarderSessionGoneError):
         tracker.record_failure("k", exc)
+
+
+def test_own_session_tracker_keeps_bounded_retry_on_missing_parent_inbox() -> None:
+    # The runner can restore the parent inbox, so this 503 is retried, not terminal.
+    tracker = forwarder._PostRetryTracker(stop_on_session_gone=True, max_not_confirmed_attempts=3)
+    exc = _server_wrapped_not_confirmed_error("missing_parent_inbox")
+    assert tracker.record_failure("k", exc).exhausted is False
+    assert tracker.record_failure("k", exc).exhausted is False
+    assert tracker.record_failure("k", exc).exhausted is True
 
 
 def test_subagent_tracker_keeps_bounded_retry_on_session_gone_failure() -> None:
@@ -8160,17 +8158,15 @@ def test_subagent_tracker_keeps_bounded_retry_on_session_gone_failure() -> None:
 
 
 @pytest.mark.asyncio
-async def test_supervisor_stops_forwarder_once_when_parent_inbox_is_missing(
+async def test_forwarder_delivers_status_after_parent_inbox_returns(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
-    A child whose parent inbox is gone stops forwarding instead of retrying forever.
+    A missing parent inbox is retried, so the report lands once the inbox is back.
 
-    The server re-wraps the runner's ``subagent_delivery_not_confirmed`` 503,
-    so every terminal status post fails the same way. The forwarder must give
-    up after the first such failure and log it once, without a traceback.
+    The runner can restore a parent inbox after rejecting a child's terminal
+    status. The forwarder must keep retrying rather than stop on the first 503.
     """
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "session.jsonl"
@@ -8182,14 +8178,73 @@ async def test_supervisor_stops_forwarder_once_when_parent_inbox_is_missing(
     )
     status_posts: list[str] = []
 
-    async def _always_parent_inbox_missing(*_: Any, **kwargs: Any) -> None:
+    async def _inbox_missing_then_restored(*_: Any, **kwargs: Any) -> None:
         status_posts.append(kwargs["status"])
-        raise _server_wrapped_not_confirmed_error("missing_parent_inbox")
+        if len(status_posts) == 1:
+            raise _server_wrapped_not_confirmed_error("missing_parent_inbox")
+
+    monkeypatch.setattr(forwarder, "post_external_session_status", _inbox_missing_then_restored)
+    server, thread, base_url = _start_recording_server()
+    task = asyncio.create_task(
+        forward_claude_transcript_to_session(
+            base_url=base_url,
+            headers={},
+            session_id="conv_child",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=False,
+            poll_interval_s=0.01,
+        )
+    )
+    try:
+        state = await _wait_for_json_state(
+            bridge_dir / "hook_forwarder.json",
+            lambda payload: payload.get("event_cursor") == 2,
+            # Covers forwarder startup plus the first 1 s retry backoff.
+            timeout_s=15.0,
+        )
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5.0)
+
+    assert status_posts == ["failed", "failed"]
+    assert state["event_cursor"] == 2
+
+
+@pytest.mark.asyncio
+async def test_supervisor_stops_forwarder_once_when_session_is_gone(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A forwarder whose session was deleted stops instead of retrying forever.
+
+    Every status post returns 404. The forwarder must give up after the
+    first one and log it once, without a traceback.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    _record_session_start(bridge_dir, transcript_path)
+    record_hook_event(
+        bridge_dir,
+        {"hook_event_name": "StopFailure", "session_id": "claude-session"},
+    )
+    status_posts: list[str] = []
+
+    async def _always_session_missing(*_: Any, **kwargs: Any) -> None:
+        status_posts.append(kwargs["status"])
+        raise _http_status_error(404, {"error": {"code": "not_found", "message": "gone"}})
 
     async def _no_sleep(_seconds: float) -> None:
         return None
 
-    monkeypatch.setattr(forwarder, "post_external_session_status", _always_parent_inbox_missing)
+    monkeypatch.setattr(forwarder, "post_external_session_status", _always_session_missing)
     monkeypatch.setattr(forwarder, "_supervisor_sleep", _no_sleep)
     server, thread, base_url = _start_recording_server()
     try:
@@ -8214,7 +8269,7 @@ async def test_supervisor_stops_forwarder_once_when_parent_inbox_is_missing(
     assert status_posts == ["failed"]
     forwarder_records = [r for r in caplog.records if r.name == forwarder.__name__]
     assert [r.levelno for r in forwarder_records] == [logging.WARNING]
-    assert "missing_parent_inbox" in forwarder_records[0].getMessage()
+    assert "http 404" in forwarder_records[0].getMessage()
     assert forwarder_records[0].exc_info is None
 
 
