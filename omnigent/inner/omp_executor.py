@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import contextlib
 import json
 import logging
@@ -47,6 +48,11 @@ logger = logging.getLogger(__name__)
 
 # OMP process must stay alive across turns; default wait for clean shutdown.
 _OMP_SHUTDOWN_TIMEOUT_S = 10.0
+
+# A malicious ``count`` must not allocate an unbounded sparse segment list.
+# Normal chunks fill frames near ``maxFrameBytes``, so this ceiling is far above
+# any legitimate reassembly sequence while keeping allocation bounded.
+_MAX_RPC_CHUNK_COUNT = 8_192
 
 # OMP model catalog JSON is emitted by ``omp models --json``; we do not try
 # to parse it here, but ``OmpProfileConfig`` (omnigent/omp_config.py) does.
@@ -109,7 +115,12 @@ class _OmpChunkBuffer:
             )
         if self._segments[index] is not None:
             raise OmpProtocolError(f"rpc_chunk {self.chunk_id} index {index} duplicated")
-        segment = base64.b64decode(data, validate=True)
+        try:
+            segment = base64.b64decode(data, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise OmpProtocolError(
+                f"rpc_chunk {self.chunk_id} contains invalid base64 data"
+            ) from exc
         self._segments[index] = segment
         self.received += 1
         self._decoded_bytes += len(segment)
@@ -125,7 +136,10 @@ class _OmpChunkBuffer:
                 f"rpc_chunk {self.chunk_id} reassembled byte length {len(decoded)} "
                 f"does not match advertised {byte_length}"
             )
-        return decoded.decode("utf-8")
+        try:
+            return decoded.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as exc:
+            raise OmpProtocolError(f"rpc_chunk {self.chunk_id} is not valid UTF-8") from exc
 
 
 class _OmpRpcSession:
@@ -159,6 +173,8 @@ class _OmpRpcSession:
         self._events: asyncio.Queue[_JsonObject] = asyncio.Queue()
         self._write_lock = asyncio.Lock()
         self._chunk_buffers: dict[str, _OmpChunkBuffer] = {}
+        self._active_chunk_id: str | None = None
+        self._failure: OmpProtocolError | None = None
         self._callback_tasks: set[asyncio.Task[None]] = set()
         # Callbacks wired after construction by the bridge/adapter.
         self._tool_executor: ToolExecutor | None = None
@@ -172,6 +188,11 @@ class _OmpRpcSession:
     def command(self) -> list[str]:
         return list(self._command)
 
+    @property
+    def failed(self) -> bool:
+        """Whether the reader has stopped due to a terminal protocol failure."""
+        return self._failure is not None
+
     def set_tool_executor(self, executor: ToolExecutor | None) -> None:
         self._tool_executor = executor
 
@@ -180,6 +201,8 @@ class _OmpRpcSession:
 
     async def start(self) -> None:
         """Spawn OMP and negotiate protocol v2."""
+        if self._failure is not None:
+            raise self._failure
         if self._process is not None:
             return
         cwd = str(self._cwd) if self._cwd else None
@@ -204,9 +227,7 @@ class _OmpRpcSession:
         """Read the ready frame and opt in to v2 when advertised."""
         ready = await self._read_one_frame(timeout=30.0)
         if not isinstance(ready, dict) or ready.get("type") != "ready":
-            raise OmpProtocolError(
-                f"Expected OMP ready frame, got: {ready!r}"
-            )
+            raise OmpProtocolError(f"Expected OMP ready frame, got: {ready!r}")
         self._max_frame_bytes = int(ready.get("maxFrameBytes", self._max_frame_bytes))
         self._max_reassembled_frame_bytes = int(
             ready.get("maxReassembledFrameBytes", self._max_reassembled_frame_bytes)
@@ -243,10 +264,21 @@ class _OmpRpcSession:
         finally:
             self._pending.pop(req_id, None)
 
-    async def send_command_no_wait(self, payload: _JsonObject) -> str:
-        """Send a command without awaiting a response; return its id."""
+    async def send_command_no_wait(
+        self,
+        payload: _JsonObject,
+        *,
+        request_id: str | None = None,
+    ) -> str:
+        """Send a command without awaiting a response; return its id.
+
+        Callback result frames must retain the inbound callback id: OMP uses
+        that id to resolve the pending host-tool, host-URI, or UI request.
+        """
         await self.start()
-        req_id = self._next_request_id()
+        payload_id = payload.get("id")
+        req_id = request_id or (payload_id if isinstance(payload_id, str) else None)
+        req_id = req_id or self._next_request_id()
         payload = {**payload, "id": req_id}
         await self._write_frame(payload)
         return req_id
@@ -286,17 +318,30 @@ class _OmpRpcSession:
                 except json.JSONDecodeError as exc:
                     logger.warning("Ignoring malformed JSONL frame from OMP: %s", exc)
                     continue
+                if not isinstance(frame, dict):
+                    logger.warning("Ignoring non-object JSONL frame from OMP: %r", frame)
+                    continue
                 await self._handle_frame(frame)
         except asyncio.CancelledError:
             pass
         except Exception as exc:
-            logger.exception("OMP RPC reader loop failed: %s", exc)
+            self._failure = (
+                exc
+                if isinstance(exc, OmpProtocolError)
+                else OmpProtocolError(_describe_exception(exc))
+            )
+            logger.exception("OMP RPC reader loop failed: %s", self._failure)
         finally:
-            # Resolve any still-pending requests with a diagnostic so waiters
-            # do not hang forever.
-            for future in list(self._pending.values()):
-                if not future.done():
-                    future.set_exception(OmpProtocolError("OMP RPC reader ended unexpectedly"))
+            # A stopped reader is terminal for this process. Mark it failed so
+            # the executor tears it down and creates a fresh session instead
+            # of attaching future requests to a dead reader task.
+            if not self._closed and self._failure is None:
+                self._failure = OmpProtocolError("OMP RPC reader ended unexpectedly")
+            failure = self._failure
+            if failure is not None:
+                for future in list(self._pending.values()):
+                    if not future.done():
+                        future.set_exception(failure)
             self._pending.clear()
 
     async def _handle_frame(self, frame: _JsonObject) -> None:
@@ -344,43 +389,64 @@ class _OmpRpcSession:
         task.add_done_callback(self._callback_tasks.discard)
 
     async def _reassemble_chunk(self, chunk: _JsonObject) -> _JsonObject | None:
-        chunk_id = str(chunk.get("chunkId", ""))
+        chunk_id = chunk.get("chunkId")
         index = chunk.get("index")
         count = chunk.get("count")
         byte_length = chunk.get("byteLength")
         data = chunk.get("data")
         if (
             not isinstance(chunk_id, str)
-            or not isinstance(index, int)
-            or not isinstance(count, int)
-            or not isinstance(byte_length, int)
+            or type(index) is not int
+            or type(count) is not int
+            or type(byte_length) is not int
             or not isinstance(data, str)
+            or not chunk_id
+            or index < 0
+            or count <= 0
+            or byte_length < 0
         ):
-            logger.warning("Malformed rpc_chunk frame from OMP: %r", chunk)
-            return None
+            raise OmpProtocolError(f"Malformed rpc_chunk frame from OMP: {chunk!r}")
+        if count > _MAX_RPC_CHUNK_COUNT:
+            raise OmpProtocolError(
+                f"rpc_chunk sequence {chunk_id} exceeds maximum chunk count {_MAX_RPC_CHUNK_COUNT}"
+            )
         if byte_length > self._max_reassembled_frame_bytes:
             raise OmpProtocolError(
                 f"rpc_chunk sequence {chunk_id} exceeds maxReassembledFrameBytes"
             )
+        if self._active_chunk_id is None:
+            self._active_chunk_id = chunk_id
+        elif self._active_chunk_id != chunk_id:
+            raise OmpProtocolError(
+                f"rpc_chunk sequence {chunk_id} interleaved with {self._active_chunk_id}"
+            )
+
         buf = self._chunk_buffers.get(chunk_id)
         if buf is None:
             buf = _OmpChunkBuffer(chunk_id, count, byte_length)
             self._chunk_buffers[chunk_id] = buf
-        assembled = None
+        elif buf.count != count or buf.byte_length != byte_length:
+            raise OmpProtocolError(f"rpc_chunk sequence {chunk_id} changed its declared shape")
         try:
             assembled = buf.add(index, data, byte_length)
         except OmpProtocolError:
             self._chunk_buffers.pop(chunk_id, None)
+            self._active_chunk_id = None
             raise
-        if assembled is not None:
-            self._chunk_buffers.pop(chunk_id, None)
-            try:
-                return json.loads(assembled)  # type: ignore[return-value]
-            except json.JSONDecodeError as exc:
-                raise OmpProtocolError(
-                    f"Reassembled v2 frame {chunk_id} is not valid JSON: {exc}"
-                ) from exc
-        return None
+        if assembled is None:
+            return None
+
+        self._chunk_buffers.pop(chunk_id, None)
+        self._active_chunk_id = None
+        try:
+            decoded = json.loads(assembled)
+        except json.JSONDecodeError as exc:
+            raise OmpProtocolError(
+                f"Reassembled v2 frame {chunk_id} is not valid JSON: {exc}"
+            ) from exc
+        if not isinstance(decoded, dict):
+            raise OmpProtocolError(f"Reassembled v2 frame {chunk_id} is not a JSON object")
+        return decoded
 
     async def _handle_host_tool_call(self, frame: _JsonObject) -> None:
         call_id = str(frame.get("id", ""))
@@ -401,41 +467,49 @@ class _OmpRpcSession:
                 result = {"result": resolved}
             except Exception as exc:  # noqa: BLE001
                 result = {"isError": True, "error": _describe_exception(exc)}
-        await self.send_command_no_wait({
-            "type": "host_tool_result",
-            "id": call_id,
-            **result,
-        })
+        await self.send_command_no_wait(
+            {
+                "type": "host_tool_result",
+                "id": call_id,
+                **result,
+            }
+        )
 
     async def _handle_host_uri_request(self, frame: _JsonObject) -> None:
         req_id = str(frame.get("id", ""))
         # Host URI schemes are not implemented in this layer; reject cleanly.
-        await self.send_command_no_wait({
-            "type": "host_uri_result",
-            "id": req_id,
-            "isError": True,
-            "error": "Host URI schemes are not supported by this executor",
-        })
+        await self.send_command_no_wait(
+            {
+                "type": "host_uri_result",
+                "id": req_id,
+                "isError": True,
+                "error": "Host URI schemes are not supported by this executor",
+            }
+        )
 
     async def _handle_extension_ui_request(self, frame: _JsonObject) -> None:
         req_id = str(frame.get("id", ""))
         method = str(frame.get("method", ""))
         if self._elicitation_handler is None:
-            await self.send_command_no_wait({
-                "type": "extension_ui_response",
-                "id": req_id,
-                "cancelled": True,
-            })
+            await self.send_command_no_wait(
+                {
+                    "type": "extension_ui_response",
+                    "id": req_id,
+                    "cancelled": True,
+                }
+            )
             return
         try:
             answer = await self._elicitation_handler(method, frame)
         except Exception as exc:  # noqa: BLE001
             logger.debug("Extension UI handler failed for %s: %s", method, exc)
-            await self.send_command_no_wait({
-                "type": "extension_ui_response",
-                "id": req_id,
-                "cancelled": True,
-            })
+            await self.send_command_no_wait(
+                {
+                    "type": "extension_ui_response",
+                    "id": req_id,
+                    "cancelled": True,
+                }
+            )
             return
         # Normalize handler answer to the response shape OMP expects.
         response: _JsonObject = {"type": "extension_ui_response", "id": req_id}
@@ -489,6 +563,8 @@ class _OmpRpcSession:
         if self._callback_tasks:
             await asyncio.gather(*self._callback_tasks, return_exceptions=True)
         self._callback_tasks.clear()
+        self._chunk_buffers.clear()
+        self._active_chunk_id = None
         self._process = None
         self._reader_task = None
 
@@ -571,7 +647,14 @@ class OmpExecutor(Executor):
         host-owned RPC tools, and yields translated events until the turn
         completes.
         """
-        session = await self._ensure_session()
+        try:
+            session = await self._ensure_session()
+            # Capture resume state for every normal turn, not only native
+            # callers that explicitly query it.
+            await self.get_state()
+        except OmpProtocolError as exc:
+            yield ExecutorError(message=f"Failed to start OMP: {exc}")
+            return
         if self._tool_executor is not None:
             session.set_tool_executor(self._tool_executor)
         if self._elicitation_handler is not None:
@@ -581,25 +664,39 @@ class OmpExecutor(Executor):
         if user_message is None:
             user_message = ""
 
-        # Register Omnigent tools as host-owned tools for this turn.
-        if tools:
-            host_tools = [_tool_spec_to_host_tool(t) for t in tools]
-            try:
-                await session.send_command({"type": "set_host_tools", "tools": host_tools})
-            except OmpProtocolError as exc:
-                yield ExecutorError(message=f"Failed to register tools with OMP: {exc}")
-                return
+        # ``set_host_tools`` replaces OMP's complete registration, including
+        # when this turn intentionally exposes no host-owned tools.
+        host_tools = [_tool_spec_to_host_tool(t) for t in tools]
+        try:
+            await session.send_command({"type": "set_host_tools", "tools": host_tools})
+        except OmpProtocolError as exc:
+            yield ExecutorError(message=f"Failed to register tools with OMP: {exc}")
+            return
 
-        # Optional model/effort overrides from ExecutorConfig.
+        # A request-specific override takes precedence over the AgentSpec
+        # model passed through HARNESS_OMP_MODEL at executor construction.
         config = config or ExecutorConfig()
-        if config.model:
-            provider, model_id = _split_model(config.model)
-            if provider and model_id:
-                await session.send_command({
-                    "type": "set_model",
-                    "provider": provider,
-                    "modelId": model_id,
-                })
+        selected_model = config.model or self._configured_model
+        if selected_model:
+            provider, model_id = _split_model(selected_model)
+            if not provider or not model_id:
+                yield ExecutorError(
+                    message=f"OMP model must use provider/model form: {selected_model}"
+                )
+                return
+            try:
+                response = await session.send_command(
+                    {
+                        "type": "set_model",
+                        "provider": provider,
+                        "modelId": model_id,
+                    }
+                )
+                if not response.get("success"):
+                    raise OmpProtocolError(response.get("error", "OMP set_model failed"))
+            except OmpProtocolError as exc:
+                yield ExecutorError(message=f"Failed to set OMP model: {exc}")
+                return
 
         # Send the user prompt and wait for the ack before streaming events.
         try:
@@ -609,6 +706,12 @@ class OmpExecutor(Executor):
             return
         if not response.get("success"):
             yield ExecutorError(message=f"OMP prompt failed: {response.get('error', 'rejected')}")
+            return
+
+        prompt_id = response.get("id") if isinstance(response.get("id"), str) else None
+        response_data = response.get("data")
+        if isinstance(response_data, dict) and response_data.get("agentInvoked") is False:
+            yield TurnComplete(response=None)
             return
 
         response_text = ""
@@ -624,7 +727,7 @@ class OmpExecutor(Executor):
                     response_text += item.text
                 yield item
 
-            if _is_terminal_agent_end(event):
+            if _is_local_prompt_result(event, prompt_id) or _is_terminal_agent_end(event):
                 yield TurnComplete(response=response_text or None)
                 return
 
@@ -682,11 +785,13 @@ class OmpExecutor(Executor):
     async def set_model(self, provider: str, model_id: str) -> None:
         """Change the live OMP model."""
         session = await self._ensure_session()
-        response = await session.send_command({
-            "type": "set_model",
-            "provider": provider,
-            "modelId": model_id,
-        })
+        response = await session.send_command(
+            {
+                "type": "set_model",
+                "provider": provider,
+                "modelId": model_id,
+            }
+        )
         if not response.get("success"):
             raise OmpProtocolError(response.get("error", "OMP set_model failed"))
 
@@ -718,13 +823,23 @@ class OmpExecutor(Executor):
     # ------------------------------------------------------------------
 
     async def _ensure_session(self) -> _OmpRpcSession:
+        if self._session is not None and self._session.failed:
+            failed_session = self._session
+            self._session = None
+            await failed_session.close()
         if self._session is None:
             command = [*self._base_command, *self._extra_args]
-            self._session = _OmpRpcSession(command, cwd=self._cwd, env=self._env)
-            await self._session.start()
+            session = _OmpRpcSession(command, cwd=self._cwd, env=self._env)
+            self._session = session
+            try:
+                await session.start()
+            except OmpProtocolError:
+                self._session = None
+                await session.close()
+                raise
             # Wire callbacks each time a session is created.
-            self._session.set_tool_executor(self._tool_executor)
-            self._session.set_elicitation_handler(self._elicitation_handler)
+            session.set_tool_executor(self._tool_executor)
+            session.set_elicitation_handler(self._elicitation_handler)
         return self._session
 
     def _translate_event(self, event: _JsonObject) -> list[ExecutorEvent]:
@@ -852,9 +967,7 @@ def _parse_model_catalog(raw: JsonValue | None) -> list[_OmpModelOption]:
             _OmpModelOption(
                 provider=provider,
                 model_id=model_id,
-                display_name=str(
-                    entry.get("displayName") or entry.get("name") or model_id
-                ),
+                display_name=str(entry.get("displayName") or entry.get("name") or model_id),
                 provider_name=(
                     str(entry.get("providerName")) if entry.get("providerName") else None
                 ),
@@ -870,6 +983,16 @@ def _is_terminal_agent_end(event: _JsonObject) -> bool:
         isinstance(event, dict)
         and event.get("type") == "agent_end"
         and event.get("isTerminal") is not False
+    )
+
+
+def _is_local_prompt_result(event: _JsonObject, prompt_id: str | None) -> bool:
+    """Return whether *event* completes the correlated prompt locally."""
+    return (
+        prompt_id is not None
+        and event.get("type") == "prompt_result"
+        and event.get("id") == prompt_id
+        and event.get("agentInvoked") is False
     )
 
 

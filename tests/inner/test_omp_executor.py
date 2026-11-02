@@ -22,7 +22,7 @@ from omnigent.inner.executor import (
     ToolSpec,
     TurnComplete,
 )
-from omnigent.inner.omp_executor import OmpExecutor
+from omnigent.inner.omp_executor import OmpExecutor, OmpProtocolError
 
 FAKE_OMP = Path(__file__).with_name("fake_omp.py")
 
@@ -33,12 +33,18 @@ def _write_scenario(tmp_path: Path, scenario: dict[str, Any]) -> Path:
     return path
 
 
-def _executor(tmp_path: Path, scenario: dict[str, Any]) -> OmpExecutor:
+def _executor(
+    tmp_path: Path,
+    scenario: dict[str, Any],
+    *,
+    model: str | None = None,
+) -> OmpExecutor:
     scenario_path = _write_scenario(tmp_path, scenario)
     return OmpExecutor(
         command=[sys.executable, str(FAKE_OMP), str(scenario_path)],
         cwd=tmp_path,
         env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        model=model,
     )
 
 
@@ -186,6 +192,66 @@ async def test_prompt_ack_no_agent_end_does_not_complete(tmp_path: Path) -> None
             ),
             timeout=0.5,
         )
+    await executor.close()
+
+
+async def test_local_only_prompt_ack_completes_without_agent_end(tmp_path: Path) -> None:
+    executor = _executor(
+        tmp_path,
+        {
+            "ready": _ready(),
+            "interactions": [
+                {
+                    "match": {"type": "prompt"},
+                    "response": {
+                        "type": "response",
+                        "command": "prompt",
+                        "success": True,
+                        "data": {"agentInvoked": False},
+                    },
+                }
+            ],
+        },
+    )
+    events = await asyncio.wait_for(
+        _collect_events(
+            executor.run_turn(
+                messages=[{"role": "user", "content": "/help"}], tools=[], system_prompt=""
+            )
+        ),
+        timeout=0.5,
+    )
+    assert len(events) == 1
+    assert isinstance(events[0], TurnComplete)
+    await executor.close()
+
+
+async def test_late_local_only_prompt_result_completes_without_agent_end(tmp_path: Path) -> None:
+    executor = _executor(
+        tmp_path,
+        {
+            "ready": _ready(),
+            "interactions": [
+                {
+                    "match": {"type": "prompt"},
+                    "response": {"type": "response", "command": "prompt", "success": True},
+                    "events": [
+                        {"type": "prompt_result", "id": "omp_req_4", "agentInvoked": False}
+                    ],
+                }
+            ],
+        },
+    )
+    events = await asyncio.wait_for(
+        _collect_events(
+            executor.run_turn(
+                messages=[{"role": "user", "content": "/help"}], tools=[], system_prompt=""
+            )
+        ),
+        timeout=0.5,
+    )
+    assert len(events) == 1
+    assert isinstance(events[0], TurnComplete)
     await executor.close()
 
 
@@ -384,8 +450,91 @@ async def test_host_tool_callback_failure(tmp_path: Path) -> None:
     result_lines = [ln for ln in lines if '"type":"host_tool_result"' in ln]
     assert result_lines, "expected host_tool_result frame in fake log"
     frame = json.loads(result_lines[-1].split(": ", 1)[1])
+    assert frame.get("id") == "host_1"
     assert frame.get("isError") is True
     assert "exploded" in frame.get("error", "")
+
+
+async def test_host_uri_callback_preserves_inbound_request_id(tmp_path: Path) -> None:
+    log_path = tmp_path / "fake.log"
+    executor = _executor(
+        tmp_path,
+        {
+            "ready": _ready(),
+            "log": str(log_path),
+            "interactions": [
+                {
+                    "match": {"type": "prompt"},
+                    "response": {
+                        "type": "response",
+                        "command": "prompt",
+                        "success": True,
+                        "data": {"agentInvoked": True},
+                    },
+                    "events": [
+                        {"type": "host_uri_request", "id": "uri_1", "url": "db://users/42"},
+                        {
+                            "wait_for": {"type": "host_uri_result", "id": "uri_1"},
+                            "then": [{"type": "agent_end", "isTerminal": True}],
+                        },
+                    ],
+                }
+            ],
+        },
+    )
+
+    events = await _collect_events(
+        executor.run_turn(messages=[{"role": "user", "content": "x"}], tools=[], system_prompt="")
+    )
+    assert isinstance(events[-1], TurnComplete)
+    await executor.close()
+
+    lines = log_path.read_text(encoding="utf-8").strip().splitlines()
+    frame = json.loads(
+        next(line for line in lines if '"type":"host_uri_result"' in line).split(": ", 1)[1]
+    )
+    assert frame["id"] == "uri_1"
+
+
+async def test_extension_ui_callback_preserves_inbound_request_id(tmp_path: Path) -> None:
+    log_path = tmp_path / "fake.log"
+    executor = _executor(
+        tmp_path,
+        {
+            "ready": _ready(),
+            "log": str(log_path),
+            "interactions": [
+                {
+                    "match": {"type": "prompt"},
+                    "response": {
+                        "type": "response",
+                        "command": "prompt",
+                        "success": True,
+                        "data": {"agentInvoked": True},
+                    },
+                    "events": [
+                        {"type": "extension_ui_request", "id": "ui_1", "method": "confirm"},
+                        {
+                            "wait_for": {"type": "extension_ui_response", "id": "ui_1"},
+                            "then": [{"type": "agent_end", "isTerminal": True}],
+                        },
+                    ],
+                }
+            ],
+        },
+    )
+
+    events = await _collect_events(
+        executor.run_turn(messages=[{"role": "user", "content": "x"}], tools=[], system_prompt="")
+    )
+    assert isinstance(events[-1], TurnComplete)
+    await executor.close()
+
+    lines = log_path.read_text(encoding="utf-8").strip().splitlines()
+    frame = json.loads(
+        next(line for line in lines if '"type":"extension_ui_response"' in line).split(": ", 1)[1]
+    )
+    assert frame["id"] == "ui_1"
 
 
 async def test_interrupt_via_abort(tmp_path: Path) -> None:
@@ -455,6 +604,107 @@ async def test_malformed_and_unknown_frames_do_not_hang(tmp_path: Path) -> None:
     texts = [e.text for e in events if isinstance(e, TextChunk)]
     assert texts == ["ok"]
     assert isinstance(events[-1], TurnComplete)
+    await executor.close()
+
+
+@pytest.mark.parametrize(
+    "chunk_events",
+    [
+        [
+            {
+                "raw": json.dumps(
+                    {
+                        "type": "rpc_chunk",
+                        "chunkId": "bad",
+                        "index": 0,
+                        "count": 1,
+                        "byteLength": 1,
+                        "data": "%%%",
+                    }
+                )
+            }
+        ],
+        [
+            {
+                "raw": json.dumps(
+                    {
+                        "type": "rpc_chunk",
+                        "chunkId": "large",
+                        "index": 0,
+                        "count": 1,
+                        "byteLength": 67_108_865,
+                        "data": "YQ==",
+                    }
+                )
+            }
+        ],
+        [
+            {
+                "raw": json.dumps(
+                    {
+                        "type": "rpc_chunk",
+                        "chunkId": "many",
+                        "index": 0,
+                        "count": 8_193,
+                        "byteLength": 1,
+                        "data": "YQ==",
+                    }
+                )
+            }
+        ],
+        [
+            {
+                "raw": json.dumps(
+                    {
+                        "type": "rpc_chunk",
+                        "chunkId": "first",
+                        "index": 0,
+                        "count": 2,
+                        "byteLength": 2,
+                        "data": "YQ==",
+                    }
+                )
+            },
+            {
+                "raw": json.dumps(
+                    {
+                        "type": "rpc_chunk",
+                        "chunkId": "second",
+                        "index": 0,
+                        "count": 1,
+                        "byteLength": 1,
+                        "data": "Yg==",
+                    }
+                )
+            },
+        ],
+    ],
+    ids=["malformed", "oversized-byte-length", "oversized-count", "interleaved"],
+)
+async def test_bad_v2_chunks_fail_session_and_next_call_recovers(
+    tmp_path: Path,
+    chunk_events: list[dict[str, str]],
+) -> None:
+    scenario_path = _write_scenario(
+        tmp_path,
+        {
+            "ready": _ready(),
+            "interactions": [{"match": {"type": "get_state"}, "events": chunk_events}],
+        },
+    )
+    executor = OmpExecutor(
+        command=[sys.executable, str(FAKE_OMP), str(scenario_path)],
+        cwd=tmp_path,
+        env={**os.environ, "PYTHONUNBUFFERED": "1"},
+    )
+    with pytest.raises(OmpProtocolError):
+        await executor.get_state()
+    failed_session = executor._session
+
+    _write_scenario(tmp_path, {"ready": _ready()})
+    state = await asyncio.wait_for(executor.get_state(), timeout=0.5)
+    assert state["sessionFile"] == "/tmp/fake.omp"
+    assert executor._session is not failed_session
     await executor.close()
 
 
@@ -557,4 +807,157 @@ async def test_run_turn_model_override_from_config(tmp_path: Path) -> None:
         )
     )
     assert isinstance(events[-1], TurnComplete)
+    await executor.close()
+
+
+async def test_empty_tools_replace_tools_registered_by_prior_turn(tmp_path: Path) -> None:
+    log_path = tmp_path / "fake.log"
+    executor = _executor(
+        tmp_path,
+        {
+            "ready": _ready(),
+            "log": str(log_path),
+            "interactions": [
+                {
+                    "match": {"type": "prompt", "message": "first"},
+                    "response": {
+                        "type": "response",
+                        "command": "prompt",
+                        "success": True,
+                        "data": {"agentInvoked": True},
+                    },
+                    "events": [{"type": "agent_end", "isTerminal": True}],
+                },
+                {
+                    "match": {"type": "prompt", "message": "second"},
+                    "response": {
+                        "type": "response",
+                        "command": "prompt",
+                        "success": True,
+                        "data": {"agentInvoked": True},
+                    },
+                    "events": [{"type": "agent_end", "isTerminal": True}],
+                },
+            ],
+        },
+    )
+    tool: ToolSpec = {"name": "read", "description": "read", "parameters": {"type": "object"}}
+    await _collect_events(
+        executor.run_turn(
+            messages=[{"role": "user", "content": "first"}], tools=[tool], system_prompt=""
+        )
+    )
+    await _collect_events(
+        executor.run_turn(
+            messages=[{"role": "user", "content": "second"}], tools=[], system_prompt=""
+        )
+    )
+    await executor.close()
+
+    frames = [
+        json.loads(line.split(": ", 1)[1])
+        for line in log_path.read_text(encoding="utf-8").strip().splitlines()
+        if '"type":"set_host_tools"' in line
+    ]
+    assert frames[-1]["tools"] == []
+
+
+async def test_configured_model_is_applied_and_state_is_captured_on_turn(tmp_path: Path) -> None:
+    log_path = tmp_path / "fake.log"
+    executor = _executor(
+        tmp_path,
+        {
+            "ready": _ready(),
+            "log": str(log_path),
+            "interactions": [
+                {
+                    "match": {
+                        "type": "set_model",
+                        "provider": "openai",
+                        "modelId": "gpt-5.3-codex",
+                    },
+                    "response": {"type": "response", "command": "set_model", "success": True},
+                },
+                {
+                    "match": {"type": "prompt"},
+                    "response": {
+                        "type": "response",
+                        "command": "prompt",
+                        "success": True,
+                        "data": {"agentInvoked": True},
+                    },
+                    "events": [{"type": "agent_end", "isTerminal": True}],
+                },
+            ],
+        },
+        model="openai/gpt-5.3-codex",
+    )
+    events = await _collect_events(
+        executor.run_turn(messages=[{"role": "user", "content": "x"}], tools=[], system_prompt="")
+    )
+    assert isinstance(events[-1], TurnComplete)
+    assert executor.last_session_file == "/tmp/fake.omp"
+    await executor.close()
+
+    lines = log_path.read_text(encoding="utf-8").strip().splitlines()
+    model_frame = json.loads(
+        next(line for line in lines if '"type":"set_model"' in line).split(": ", 1)[1]
+    )
+    assert model_frame["provider"] == "openai"
+    assert model_frame["modelId"] == "gpt-5.3-codex"
+
+
+async def test_startup_failure_surfaces_as_executor_error(tmp_path: Path) -> None:
+    executor = OmpExecutor(command=["missing-omp-for-test"], cwd=tmp_path)
+    events = await _collect_events(
+        executor.run_turn(messages=[{"role": "user", "content": "x"}], tools=[], system_prompt="")
+    )
+    assert len(events) == 1
+    assert isinstance(events[0], ExecutorError)
+    await executor.close()
+
+
+@pytest.mark.parametrize(
+    ("constructor_model", "config_model"),
+    [("openai/gpt-5.3-codex", None), (None, "openai/gpt-5.3-codex")],
+    ids=["configured-model", "per-turn-model"],
+)
+async def test_model_failures_surface_as_executor_error(
+    tmp_path: Path,
+    constructor_model: str | None,
+    config_model: str | None,
+) -> None:
+    executor = _executor(
+        tmp_path,
+        {
+            "ready": _ready(),
+            "interactions": [
+                {
+                    "match": {
+                        "type": "set_model",
+                        "provider": "openai",
+                        "modelId": "gpt-5.3-codex",
+                    },
+                    "response": {
+                        "type": "response",
+                        "command": "set_model",
+                        "success": False,
+                        "error": "model refused",
+                    },
+                }
+            ],
+        },
+        model=constructor_model,
+    )
+    events = await _collect_events(
+        executor.run_turn(
+            messages=[{"role": "user", "content": "x"}],
+            tools=[],
+            system_prompt="",
+            config=ExecutorConfig(model=config_model),
+        )
+    )
+    assert len(events) == 1
+    assert isinstance(events[0], ExecutorError)
+    assert "model refused" in events[0].message
     await executor.close()
