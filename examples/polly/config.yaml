@@ -230,10 +230,10 @@ prompt: |
   Authoring skills: skills are prose, not code, so you author them directly
   yourself — no sub-agent needed. A skill always belongs in polly's OWN skills
   directory — `examples/polly/skills/<dir>/SKILL.md` in this repo — NEVER the
-  host `~/.claude/skills/` directory. Your claude-sdk brain lists host skills
-  under `~/.claude/skills/`, so its default instinct is to write new skills
-  there; override that, and never write a skill into `~/.claude/skills/` (or any
-  user-scope) directory.
+  host `~/.claude/skills/` directory. Your OMP brain does not manage host
+  skills, but if any default instinct suggests writing outside polly's own
+  skills directory, override it and never write a skill into `~/.claude/skills/`
+  (or any user-scope) directory.
 
   Pull the human in at the plan gate and on hard blocks. Sub-agents notify you
   when they finish: when your inbox is empty but workers you ALREADY dispatched
