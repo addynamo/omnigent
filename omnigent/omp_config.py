@@ -19,7 +19,11 @@ from omnigent.inner.omp_executor import NativeModelOption
 OmpRunner: TypeAlias = Callable[[list[str]], subprocess.CompletedProcess[str]]
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
-_THINKING_LEVELS = frozenset({"off", "minimal", "low", "medium", "high", "xhigh"})
+# Model ids may be vendor-scoped (OpenRouter ``ai21/jamba-large-1.7``, ``~anthropic/...``).
+_MODEL_ID_RE = re.compile(r"^[A-Za-z0-9~][A-Za-z0-9._:/~-]*$")
+_THINKING_LEVELS = frozenset({"off", "minimal", "low", "medium", "high", "xhigh", "max", "auto"})
+# Role names follow the provider identifier rules (``default``, ``smol``, custom roles).
+_ROLE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 
 
 class OmpConfigError(RuntimeError):
@@ -57,6 +61,16 @@ def _validate_identifier(value: str, *, name: str) -> str:
         raise OmpValidationError(
             f"OMP {name} must be a non-empty identifier containing only letters, numbers, "
             "'.', '_', '-', or ':'."
+        )
+    return value
+
+
+def _validate_model_id(value: str) -> str:
+    """Return an OMP model id, allowing vendor-scoped ids with ``/`` and ``~``."""
+    if not isinstance(value, str) or not _MODEL_ID_RE.fullmatch(value):
+        raise OmpValidationError(
+            "OMP model id must be a non-empty identifier containing only letters, numbers, "
+            "'.', '_', '-', ':', '/', or '~', and must not start with '-' or '/'."
         )
     return value
 
@@ -108,7 +122,7 @@ def _parse_model_catalog(raw: str) -> list[NativeModelOption]:
             )
         try:
             _validate_identifier(provider, name="provider")
-            _validate_identifier(model_id, name="model id")
+            _validate_model_id(model_id)
         except OmpValidationError as exc:
             raise OmpConfigParseError(
                 command_class, "returned a catalog with an invalid model identifier."
@@ -116,11 +130,16 @@ def _parse_model_catalog(raw: str) -> list[NativeModelOption]:
         display_name = entry.get("displayName") or entry.get("name") or model_id
         provider_name = entry.get("providerName")
         aliases = entry.get("aliases", [])
+        kind = entry.get("kind") or "chat"
+        thinking = entry.get("thinking") or []
         if (
             not isinstance(display_name, str)
             or (provider_name is not None and not isinstance(provider_name, str))
             or not isinstance(aliases, list)
             or not all(isinstance(alias, str) for alias in aliases)
+            or not isinstance(kind, str)
+            or not isinstance(thinking, list)
+            or not all(isinstance(level, str) for level in thinking)
         ):
             raise OmpConfigParseError(
                 command_class, "returned a catalog with invalid model metadata."
@@ -132,6 +151,8 @@ def _parse_model_catalog(raw: str) -> list[NativeModelOption]:
                 display_name=display_name,
                 provider_name=provider_name,
                 aliases=list(aliases),
+                kind=kind,
+                thinking=list(thinking),
             )
         )
     return options
@@ -151,21 +172,42 @@ class OmpProfileConfig:
         if not isinstance(self.executable, str) or not self.executable:
             raise OmpValidationError("OMP executable must be a non-empty string.")
 
-    def list_models(self) -> list[NativeModelOption]:
-        """Return OMP's structured model catalog for the selected profile."""
-        result = self._run("models", "models", "--json")
+    def list_models(self, kind: str | None = None) -> list[NativeModelOption]:
+        """Return OMP's model catalog; ``kind="all"`` includes image, search, speech, etc."""
+        args = ["models"]
+        if kind is not None:
+            args.extend(("--kind", _validate_identifier(kind, name="model kind")))
+        result = self._run("models", *args, "--json")
         return _parse_model_catalog(result.stdout)
 
     def persist_model(self, provider: str, model_id: str) -> None:
         """Persist a default model without replacing unrelated model-role settings."""
         provider = _validate_identifier(provider, name="provider")
-        model_id = _validate_identifier(model_id, name="model id")
+        model_id = _validate_model_id(model_id)
         current_roles = self._get_model_roles()
         updated_roles = dict(current_roles)
         updated_roles["default"] = _model_role_value(
             current_roles.get("default"), provider=provider, model_id=model_id
         )
         payload = json.dumps(updated_roles, separators=(",", ":"), sort_keys=True)
+        self._run("config set", "config", "set", "modelRoles", payload)
+
+    def persist_role(self, role: str, selector: str) -> None:
+        """Assign ``selector`` (``provider/model[:effort]``) to one role, keeping the others."""
+        if not isinstance(role, str) or not _ROLE_RE.fullmatch(role):
+            raise OmpValidationError("OMP role must be a non-empty identifier, e.g. 'slow'.")
+        provider, sep, model_id = (
+            selector.partition("/") if isinstance(selector, str) else ("", "", "")
+        )
+        if not sep:
+            raise OmpValidationError(
+                "OMP role model must be provider-qualified, as 'provider/model'."
+            )
+        _validate_identifier(provider, name="provider")
+        _validate_model_id(model_id)
+        roles = dict(self._get_model_roles())
+        roles[role] = f"{provider}/{model_id}"
+        payload = json.dumps(roles, separators=(",", ":"), sort_keys=True)
         self._run("config set", "config", "set", "modelRoles", payload)
 
     def persist_thinking_level(self, level: str) -> None:
@@ -178,7 +220,18 @@ class OmpProfileConfig:
     def _get_model_roles(self) -> dict[str, Any]:
         """Read the complete role map before replacing only its default entry."""
         result = self._run("config get", "config", "get", "modelRoles", "--json")
-        return _parse_json_object(result.stdout, command_class="config get", label="modelRoles")
+        value = _parse_json_object(result.stdout, command_class="config get", label="modelRoles")
+        # ``omp config get --json`` wraps the record as ``{"key", "value", "type", ...}``.
+        if value.get("key") == "modelRoles" and "value" in value:
+            roles = value["value"]
+            if roles is None:
+                return {}
+            if not isinstance(roles, dict):
+                raise OmpConfigParseError(
+                    "config get", "returned a modelRoles value that is not an object."
+                )
+            return roles
+        return value
 
     def _run(self, command_class: str, *args: str) -> subprocess.CompletedProcess[str]:
         """Run one OMP argv command and convert start/nonzero failures to typed errors."""
@@ -210,10 +263,16 @@ def _model_role_value(existing: object, *, provider: str, model_id: str) -> obje
 
 
 def list_omp_models(
-    profile: str | None, *, runner: OmpRunner = _default_runner, executable: str = "omp"
+    profile: str | None,
+    *,
+    kind: str | None = None,
+    runner: OmpRunner = _default_runner,
+    executable: str = "omp",
 ) -> list[NativeModelOption]:
     """List OMP models through an injectable profile-scoped CLI boundary."""
-    return OmpProfileConfig(profile=profile, runner=runner, executable=executable).list_models()
+    return OmpProfileConfig(profile=profile, runner=runner, executable=executable).list_models(
+        kind
+    )
 
 
 def persist_omp_model(
@@ -227,6 +286,20 @@ def persist_omp_model(
     """Persist the selected default model through ``omp config set`` only."""
     OmpProfileConfig(profile=profile, runner=runner, executable=executable).persist_model(
         provider, model_id
+    )
+
+
+def persist_omp_role(
+    profile: str | None,
+    role: str,
+    selector: str,
+    *,
+    runner: OmpRunner = _default_runner,
+    executable: str = "omp",
+) -> None:
+    """Assign a model selector to one OMP role through ``omp config set`` only."""
+    OmpProfileConfig(profile=profile, runner=runner, executable=executable).persist_role(
+        role, selector
     )
 
 
@@ -252,5 +325,6 @@ __all__ = [
     "OmpValidationError",
     "list_omp_models",
     "persist_omp_model",
+    "persist_omp_role",
     "persist_omp_thinking_level",
 ]

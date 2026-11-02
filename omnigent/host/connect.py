@@ -2365,7 +2365,9 @@ class HostProcess:
             try:
                 from omnigent.omp_config import list_omp_models
 
-                omp_models = await asyncio.to_thread(list_omp_models, None)
+                omp_models = await asyncio.to_thread(
+                    functools.partial(list_omp_models, None, kind="all")
+                )
             except Exception:
                 _logger.exception("Failed to resolve pre-launch OMP model options")
                 return HostModelOptionsResultFrame(
@@ -2380,6 +2382,9 @@ class HostProcess:
                     {
                         "id": f"{model.provider}/{model.model_id}",
                         "displayName": model.display_name,
+                        "provider": model.provider,
+                        "kind": model.kind,
+                        "thinking": list(model.thinking),
                         **({"providerName": model.provider_name} if model.provider_name else {}),
                     }
                     for model in omp_models

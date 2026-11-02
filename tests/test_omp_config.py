@@ -61,6 +61,41 @@ def test_persist_model_accepts_tagged_ollama_identifiers() -> None:
     }
 
 
+def test_persist_model_accepts_vendor_scoped_identifiers() -> None:
+    """OpenRouter-style ids like ``~anthropic/claude-opus-latest`` are valid."""
+    get_argv = ["omp", "config", "get", "modelRoles", "--json"]
+    set_argv = ["omp", "config", "set", "modelRoles"]
+    runner = FakeOmpRunner([_result(get_argv, stdout=_model_roles()), _result(set_argv)])
+
+    OmpProfileConfig(runner=runner).persist_model("openrouter", "~anthropic/claude-opus-latest")
+
+    assert json.loads(runner.calls[1][-1])["default"] == {
+        "provider": "openrouter",
+        "model": "~anthropic/claude-opus-latest",
+    }
+
+
+def test_list_models_accepts_vendor_scoped_model_ids() -> None:
+    """Catalogs with OpenRouter vendor-scoped ids must still produce options."""
+    argv = ["omp", "models", "--json"]
+    catalog = [
+        {"provider": "openai", "id": "gpt-5.6"},
+        {"provider": "openrouter", "id": "ai21/jamba-large-1.7"},
+        {"provider": "openrouter", "id": "~anthropic/claude-opus-latest"},
+        {"provider": "ollama", "id": "x/flux2-klein:latest"},
+    ]
+    runner = FakeOmpRunner([_result(argv, stdout=json.dumps(catalog))])
+
+    models = OmpProfileConfig(runner=runner).list_models()
+
+    assert [(model.provider, model.model_id) for model in models] == [
+        ("openai", "gpt-5.6"),
+        ("openrouter", "ai21/jamba-large-1.7"),
+        ("openrouter", "~anthropic/claude-opus-latest"),
+        ("ollama", "x/flux2-klein:latest"),
+    ]
+
+
 def test_persist_model_replaces_only_default_role() -> None:
     """Replacing the default model must retain every unrelated role object."""
     get_argv = ["omp", "config", "get", "modelRoles", "--json"]
@@ -168,7 +203,14 @@ def test_list_models_parses_structured_catalog() -> None:
 
 @pytest.mark.parametrize(
     ("provider", "model_id"),
-    [("", "gpt-5.6"), ("open ai", "gpt-5.6"), ("openai", "gpt/5.6"), ("openai", "")],
+    [
+        ("", "gpt-5.6"),
+        ("open ai", "gpt-5.6"),
+        ("openai", "gpt 5.6"),
+        ("openai", "-gpt-5.6"),
+        ("openai", "/gpt-5.6"),
+        ("openai", ""),
+    ],
 )
 def test_persist_model_rejects_invalid_identifiers(provider: str, model_id: str) -> None:
     """Invalid identifiers must fail before OMP receives a potentially unsafe argument."""
@@ -244,3 +286,107 @@ def test_nonzero_omp_commands_raise_typed_errors(method: str, argv: list[str]) -
         action()
 
     assert exc_info.value.returncode == 1
+
+
+def _wrapped_model_roles() -> str:
+    """Real ``omp config get modelRoles --json`` output wraps the record in an envelope."""
+    return json.dumps(
+        {
+            "key": "modelRoles",
+            "value": {
+                "default": "ollama/kimi-k2.7-code:cloud:high",
+                "slow": "ollama/deepseek-v4-flash:cloud:high",
+            },
+            "type": "record",
+            "description": "",
+        }
+    )
+
+
+def test_persist_model_unwraps_real_config_envelope() -> None:
+    """Saving the default model must write the role map, never OMP's JSON envelope."""
+    get_argv = ["omp", "config", "get", "modelRoles", "--json"]
+    set_argv = ["omp", "config", "set", "modelRoles"]
+    runner = FakeOmpRunner([_result(get_argv, stdout=_wrapped_model_roles()), _result(set_argv)])
+
+    OmpProfileConfig(runner=runner).persist_model("openai", "gpt-5.6")
+
+    assert json.loads(runner.calls[1][-1]) == {
+        "default": "openai/gpt-5.6",
+        "slow": "ollama/deepseek-v4-flash:cloud:high",
+    }
+
+
+def test_persist_role_sets_one_role_with_effort_suffix() -> None:
+    """Assigning a role writes ``selector:effort`` for that role and keeps the others."""
+    get_argv = ["omp", "config", "get", "modelRoles", "--json"]
+    set_argv = ["omp", "config", "set", "modelRoles"]
+    runner = FakeOmpRunner([_result(get_argv, stdout=_wrapped_model_roles()), _result(set_argv)])
+
+    OmpProfileConfig(runner=runner).persist_role(
+        "plan", "openrouter/~anthropic/claude-opus-latest:max"
+    )
+
+    assert runner.calls[1][:4] == set_argv
+    assert json.loads(runner.calls[1][-1]) == {
+        "default": "ollama/kimi-k2.7-code:cloud:high",
+        "slow": "ollama/deepseek-v4-flash:cloud:high",
+        "plan": "openrouter/~anthropic/claude-opus-latest:max",
+    }
+
+
+@pytest.mark.parametrize(
+    ("role", "selector"),
+    [
+        ("", "openai/gpt-5.6"),
+        ("bad role", "openai/gpt-5.6"),
+        ("-default", "openai/gpt-5.6"),
+        ("slow", "gpt-5.6"),  # selectors must be provider-qualified
+        ("slow", "openai/-gpt"),
+        ("slow", "open ai/gpt-5.6"),
+    ],
+)
+def test_persist_role_rejects_invalid_values(role: str, selector: str) -> None:
+    """Invalid role names or selectors fail before OMP is run."""
+    runner = FakeOmpRunner([])
+
+    with pytest.raises(OmpValidationError):
+        OmpProfileConfig(runner=runner).persist_role(role, selector)
+
+    assert runner.calls == []
+
+
+def test_list_models_all_kinds_carries_kind_and_effort_ladder() -> None:
+    """``kind="all"`` lists every catalog kind with each model's supported efforts."""
+    argv = ["omp", "models", "--kind", "all", "--json"]
+    catalog = [
+        {
+            "provider": "ollama",
+            "id": "deepseek-v4-flash:cloud",
+            "kind": "chat",
+            "thinking": ["low", "high", "max"],
+        },
+        {"provider": "openai-codex", "id": "gpt-image-2", "kind": "image"},
+        {"provider": "web", "id": "brave", "kind": "search"},
+    ]
+    runner = FakeOmpRunner([_result(argv, stdout=json.dumps(catalog))])
+
+    models = OmpProfileConfig(runner=runner).list_models(kind="all")
+
+    assert runner.calls == [argv]
+    assert [(m.provider, m.model_id, m.kind, m.thinking) for m in models] == [
+        ("ollama", "deepseek-v4-flash:cloud", "chat", ["low", "high", "max"]),
+        ("openai-codex", "gpt-image-2", "image", []),
+        ("web", "brave", "search", []),
+    ]
+
+
+@pytest.mark.parametrize("level", ["max", "auto"])
+def test_persist_thinking_level_accepts_omp18_levels(level: str) -> None:
+    """OMP 18 adds ``max`` and ``auto`` as default thinking levels."""
+    argv = ["omp", "config", "set", "defaultThinkingLevel", level]
+    runner = FakeOmpRunner([_result(argv)])
+
+    OmpProfileConfig(runner=runner).persist_thinking_level(level)
+
+    assert runner.calls == [argv]

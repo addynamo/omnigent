@@ -90,6 +90,10 @@ class _OmpModelOption:
     display_name: str
     provider_name: str | None = None
     aliases: list[str] = field(default_factory=list)
+    # Catalog kind (``chat``, ``image``, ``search``, ``tts``, ``stt``, ``judge``, ``tiny``, ...).
+    kind: str = "chat"
+    # Thinking levels the model supports, e.g. ``["low", "high", "max"]``.
+    thinking: list[str] = field(default_factory=list)
 
 
 class _OmpChunkBuffer:

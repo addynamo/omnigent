@@ -196,7 +196,8 @@ def omp_native_terminal_command(
     if profile is not None:
         bridge_args.extend(["--profile", profile])
     for arg in extra_args or ():
-        bridge_args.extend(["--extra-arg", arg])
+        # ``=`` form so argparse accepts dash-prefixed values like ``--model=...``.
+        bridge_args.append(f"--extra-arg={arg}")
     if session_file is not None:
         bridge_args.extend(["--resume", str(session_file)])
     bridge_command = " ".join(shlex.quote(part) for part in ["python", *bridge_args])

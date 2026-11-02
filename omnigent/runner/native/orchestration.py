@@ -507,6 +507,7 @@ class _PiNativeLaunchConfig:
     fork_source_external_id: str | None = None
     fork_carry_history: bool = False
     model_override: str | None = None
+    labels: Mapping[str, str] = dataclasses.field(default_factory=dict)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -923,6 +924,11 @@ async def _pi_native_launch_config(
         fork_source_external_id=fork_source_external_id,
         fork_carry_history=fork_carry_history,
         model_override=model_override,
+        labels=(
+            {k: v for k, v in labels.items() if isinstance(k, str) and isinstance(v, str)}
+            if isinstance(labels, dict)
+            else {}
+        ),
     )
 
 
@@ -2286,6 +2292,77 @@ async def _post_pi_native_credential_warning(
         )
 
 
+# Session labels carrying a browser role assignment, saved to OMP's ``modelRoles``.
+OMP_ASSIGN_ROLE_LABEL_KEY = "omnigent.omp.assign_role"
+OMP_ASSIGN_MODEL_LABEL_KEY = "omnigent.omp.assign_model"
+
+
+def _apply_omp_role_assignment(
+    labels: Mapping[str, str],
+    profile: str | None,
+    *,
+    fresh: bool,
+    persist: Callable[..., object],
+) -> bool:
+    """
+    Save the session's browser role assignment into OMP's config on first launch.
+
+    Only fresh launches save, so a relaunch never overwrites a later TUI change.
+    A failed save is logged and the session still launches.
+
+    :param labels: Session labels, e.g. ``{OMP_ASSIGN_ROLE_LABEL_KEY: "slow", ...}``.
+    :param profile: OMP profile the bridge launches with, e.g. ``"work"``.
+    :param fresh: Whether this launch starts a new OMP session (no resume file).
+    :param persist: ``persist_omp_role(profile, role, selector)``-shaped writer.
+    :returns: Whether the assignment was saved.
+    """
+    role = labels.get(OMP_ASSIGN_ROLE_LABEL_KEY)
+    selector = labels.get(OMP_ASSIGN_MODEL_LABEL_KEY)
+    if not fresh or not role or not selector:
+        return False
+    from omnigent.omp_config import OmpConfigError, OmpValidationError
+
+    try:
+        persist(profile, role, selector)
+    except (OmpConfigError, OmpValidationError) as exc:
+        _logger.warning("omp-native: could not assign %s to OMP role %r: %s", selector, role, exc)
+        return False
+    _logger.info("omp-native: assigned %s to OMP role %r", selector, role)
+    return True
+
+
+def _omp_terminal_launch_args(
+    raw_args: list[str], model_override: str | None
+) -> tuple[str | None, list[str]]:
+    """
+    Split persisted OMP launch args into the profile and bridge passthrough args.
+
+    ``--profile`` is pulled out so the bridge can place it before ``--mode rpc``.
+    The session's picked model is appended as ``--model=`` unless the launch
+    args already pin a model.
+
+    :param raw_args: Persisted terminal launch args, e.g. ``["--profile", "work"]``.
+    :param model_override: Persisted model, e.g. ``"ollama/glm-5.1:cloud"``.
+    :returns: ``(profile, passthrough_args)``.
+    """
+    profile: str | None = None
+    passthrough: list[str] = []
+    skip_next = False
+    for i, arg in enumerate(raw_args):
+        if skip_next:
+            skip_next = False
+            continue
+        if arg == "--profile" and i + 1 < len(raw_args):
+            profile = raw_args[i + 1]
+            skip_next = True
+        else:
+            passthrough.append(arg)
+    pins_model = any(arg == "--model" or arg.startswith("--model=") for arg in passthrough)
+    if model_override and not pins_model:
+        passthrough.append(f"--model={model_override}")
+    return profile, passthrough
+
+
 async def _auto_create_omp_terminal(
     session_id: str,
     resource_registry: SessionResourceRegistry,
@@ -2344,21 +2421,19 @@ async def _auto_create_omp_terminal(
     except OSError as exc:
         raise RuntimeError(f"Cannot launch omp-native terminal: {exc}") from exc
 
-    # Pull --profile out of persisted launch args so the bridge can place it
-    # before ``--mode rpc``; remaining args are passed through as extra args.
-    profile: str | None = None
-    passthrough: list[str] = []
-    raw_args = list(launch_config.terminal_launch_args or ())
-    skip_next = False
-    for i, arg in enumerate(raw_args):
-        if skip_next:
-            skip_next = False
-            continue
-        if arg == "--profile" and i + 1 < len(raw_args):
-            profile = raw_args[i + 1]
-            skip_next = True
-        else:
-            passthrough.append(arg)
+    profile, passthrough = _omp_terminal_launch_args(
+        list(launch_config.terminal_launch_args or ()), launch_config.model_override
+    )
+
+    from omnigent.omp_config import persist_omp_role
+
+    await asyncio.to_thread(
+        _apply_omp_role_assignment,
+        launch_config.labels,
+        profile,
+        fresh=session_file is None,
+        persist=persist_omp_role,
+    )
 
     command, args = omp_native_terminal_command(
         session_id=session_id,
