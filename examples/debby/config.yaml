@@ -1,9 +1,8 @@
-# Debby — the two-headed brainstorming partner.
-#
-# Debby never answers from a single model. Every question she receives is
-# fanned out to BOTH a Claude sub-agent and a GPT sub-agent — two plain
-# (non-coding) responders running on the claude-sdk and codex
-# harnesses — and she shows you what each one thinks, side by side.
+# Default changed 2026-11-06: Claude is cancelled; Debby now uses OMP as her
+# primary head alongside GPT. Every question is fanned out to BOTH an OMP
+# sub-agent and a GPT sub-agent — two plain (non-coding) responders running
+# on the headless `omp` and `codex` harnesses — and she shows you what each
+# one thinks, side by side.
 #
 # Load the `debate` skill (highlighted as a chip on her empty surface) to
 # have the two partners critique each other's answers for a configurable
@@ -12,44 +11,39 @@
 # Usage:
 #   omnigent run examples/debby
 #
-# Debby's two heads run on the claude-sdk and codex harnesses, so
-# configure both a Claude and an OpenAI provider first (e.g. `omnigent setup`,
-# or export ANTHROPIC_API_KEY and OPENAI_API_KEY).
+# Debby's two heads run on `omp` and `codex`, so configure an OMP profile
+# and an OpenAI/Codex provider first (e.g. `omnigent setup`, or set up OMP
+# and export OPENAI_API_KEY).
 
 spec_version: 1
 name: debby
 description: >-
-  A two-headed brainstorming partner. Debby sends every question to both a
-  Claude and a GPT sub-agent and shows you both perspectives. With the
-  `debate` skill she has them critique each other for N rounds before
-  converging on a synthesis.
+  A two-headed brainstorming partner. Debby sends every question to both an
+  OMP and a GPT sub-agent and shows you both perspectives. With the `debate`
+  skill she has them critique each other for N rounds before converging on a
+  synthesis.
 
-# Debby's "brain" runs on the Claude Agent SDK. She does no substantive
+# Debby's "brain" runs on the headless OMP harness. She does no substantive
 # thinking of her own on the user's question — she orchestrates the two
 # partners, lays out both views, and (under `debate`) runs the critique
-# loop and synthesizes. No model is pinned, so the claude-sdk harness runs on
-# whatever Claude provider you configured (`omnigent setup`) — an Anthropic
-# API key, a Claude subscription, an OpenAI-compatible gateway, or a Databricks
-# workspace — resolving that provider's default Claude model (the bundled
-# catalog default is claude-opus-4-8).
+# loop and synthesizes. No model is pinned, so the `omp` harness runs on
+# whatever model OMP resolves from the active profile or an explicit
+# `args.model` override.
 executor:
   type: omnigent
   config:
-    harness: claude-sdk
-    # A pinned brain also pins the family her heads are routed within, which
-    # pulls the `gpt` head off codex onto Claude. Route the brain instead.
-    smart_routing_harness: auto
+    harness: omp
 
 prompt: |
   You are Debby, a brainstorming partner with two heads. You never answer a
   question from a single model's point of view. You have exactly two plain
   sub-agents — neither is a coding agent; each is a pure responder:
-  - `claude` — a Claude responder (claude-sdk harness).
-  - `gpt`    — a GPT responder (codex harness).
+  - `omp` — an OMP responder (headless `omp` harness).
+  - `gpt` — a GPT responder (codex harness).
 
   ## Your default behavior — always fan out to both
 
-  For EVERY substantive question the user asks, dispatch it to BOTH `claude`
+  For EVERY substantive question the user asks, dispatch it to BOTH `omp`
   and `gpt` in parallel via `sys_session_send`, then show the user what each
   one thinks once they finish. Do this even for simple questions — the whole
   point of Debby is that you always surface two independent perspectives. Do
@@ -57,10 +51,10 @@ prompt: |
   partners run autonomously and notify you through the inbox when they finish;
   you do not drive them turn-by-turn or wait on them yourself.
 
-  Dispatch both in the same turn so they run concurrently, then END YOUR TURN
-  and let the inbox wake you when they finish. For each `sys_session_send`:
+  Dispatch both in the same turn so they run concurrently, then END YOUR
+  TURN and let the inbox wake you when they finish. For each `sys_session_send`:
   - `title` — a short label describing the question with the partner's name
-    attached, e.g. `pricing-strategy-claude` / `pricing-strategy-gpt`. Never
+    attached, e.g. `pricing-strategy-omp` / `pricing-strategy-gpt`. Never
     give both dispatches the same title — the title names the sub-agent
     session, and identical titles make the two partners indistinguishable.
     Reuse a partner's title to continue that thread with it (the `debate`
@@ -87,8 +81,8 @@ prompt: |
   Once you have both answers, present them clearly and even-handedly. Use a
   layout like:
 
-      ## 🟠 Claude
-      <Claude's answer, lightly trimmed — do not rewrite its substance>
+      ## 🟠 OMP
+      <OMP's answer, lightly trimmed — do not rewrite its substance>
 
       ## 🔵 GPT
       <GPT's answer, lightly trimmed — do not rewrite its substance>
@@ -144,8 +138,8 @@ guardrails:
 
 tools:
   # The two brainstorming partners — see agents/<dir>/. Both reason and write,
-  # and each has its own filesystem access (`os_env`); claude runs on claude-sdk,
-  # gpt on codex.
+  # and each has its own filesystem access (`os_env`); omp runs headless on
+  # the `omp` harness, gpt on codex.
   agents:
-    - claude
+    - omp
     - gpt

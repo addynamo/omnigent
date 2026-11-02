@@ -254,6 +254,17 @@ def test_community_harness_can_register_background_title_generator(
     assert generator.generator == ("omnigent.community.harness.foo.background_titles:generate")
 
 
+def test_builtin_omp_harness_is_registered() -> None:
+    """The headless OMP worker harness is wired into the built-in registry."""
+    assert "omp" in hp.valid_harnesses()
+    assert hp.harness_modules()["omp"] == "omnigent.inner.omp_harness"
+    assert hp.spawn_env_builders()["omp"] == "omnigent.runtime.workflow:_build_omp_spawn_env"
+    assert hp.model_env_keys()["omp"] == "HARNESS_OMP_MODEL"
+    row = next((r for r in hp.harness_catalog() if r["id"] == "omp"), None)
+    assert row is not None
+    assert row["label"] == "OMP"
+
+
 def test_builtin_native_providers_cover_every_native_agent() -> None:
     """Every native agent has exactly one provider row keyed by the same key."""
     agent_keys = sorted(agent.key for agent in hp.native_agents())

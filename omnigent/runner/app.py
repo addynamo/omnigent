@@ -2056,6 +2056,7 @@ def create_runner_app(
     _session_comment_relays: dict[str, _CommentRelayBinding] = {}
     _codex_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _pi_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
+    _omp_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _opencode_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _cursor_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _kiro_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
@@ -2943,6 +2944,7 @@ def create_runner_app(
                 "claude": _claude_terminal_ensure_locks,
                 "codex": _codex_terminal_ensure_locks,
                 "pi": _pi_terminal_ensure_locks,
+                "omp": _omp_terminal_ensure_locks,
                 "cursor": _cursor_terminal_ensure_locks,
                 "kiro": _kiro_terminal_ensure_locks,
                 "antigravity": _antigravity_terminal_ensure_locks,
@@ -3132,8 +3134,8 @@ def create_runner_app(
 
                 _launch_pre = _antigravity_pre_launch
 
-            elif harness_name == "pi-native":
-                # pi resolves its spec unwrapped — a resolution error surfaces as
+            elif harness_name in ("pi-native", "omp-native"):
+                # pi/omp resolve their spec unwrapped — a resolution error surfaces as
                 # a terminal-start error (the resolver does not swallow it).
                 _launch_resolve_spec = lambda: _resolve_session_agent_spec(session_id)  # noqa: E731
             elif harness_name in ("cursor-native", "opencode-native", "kimi-native"):
@@ -3440,6 +3442,7 @@ def create_runner_app(
         _codex_terminal_ensure_locks.pop(session_id, None)
         _claude_terminal_ensure_locks.pop(session_id, None)
         _pi_terminal_ensure_locks.pop(session_id, None)
+        _omp_terminal_ensure_locks.pop(session_id, None)
         _cursor_terminal_ensure_locks.pop(session_id, None)
         _kiro_terminal_ensure_locks.pop(session_id, None)
         _antigravity_terminal_ensure_locks.pop(session_id, None)
@@ -4005,6 +4008,7 @@ def create_runner_app(
         if status != "failed" and harness in {
             "claude-native",
             "pi-native",
+            "omp-native",
             "cursor-native",
             "kiro-native",
             "goose-native",
@@ -4237,6 +4241,212 @@ def create_runner_app(
                 },
             )
         return Response(status_code=204)
+
+    async def _handle_omp_native_model_change(
+        conv_id: str,
+        model: str | None,
+    ) -> Response:
+        from omnigent.omp_config import OmpCommandError, persist_omp_model
+        from omnigent.omp_native_bridge import bridge_dir_for_session_id
+        from omnigent.omp_native_terminal import OmpNativeTerminalClient
+
+        if model is None or not model.strip():
+            return Response(status_code=204)
+        selected = model.strip()
+        provider, _, model_id = selected.partition("/")
+        if not provider or not model_id:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "omp_native_model_invalid",
+                    "detail": f"OMP model must be provider/model_id, got {selected!r}",
+                },
+            )
+        snapshot = await _omp_native_session_snapshot(conv_id)
+        profile = _omp_profile_from_snapshot(snapshot)
+        previous_model = snapshot.get("model_override") if isinstance(snapshot, dict) else None
+        bridge_dir = bridge_dir_for_session_id(conv_id)
+        client = OmpNativeTerminalClient(bridge_dir)
+        try:
+            await asyncio.wait_for(client.connect(), timeout=10.0)
+            response = await client.send_command(
+                {"type": "set_model", "model": selected}, wait=True
+            )
+            frame = response.get("frame") if isinstance(response, dict) else None
+            if not isinstance(frame, dict) or not frame.get("success"):
+                error = frame.get("error") if isinstance(frame, dict) else "rejected"
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": "omp_native_model_failed",
+                        "detail": f"OMP set_model failed: {error}",
+                    },
+                )
+        except (RuntimeError, asyncio.TimeoutError, OSError) as exc:
+            _logger.warning(
+                "OMP-native model change failed for session=%s", conv_id, exc_info=True
+            )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "omp_native_model_failed",
+                    "detail": _client_safe_error_detail(exc, context="omp-native model change"),
+                },
+            )
+        finally:
+            await client.close()
+
+        try:
+            await asyncio.to_thread(persist_omp_model, profile, provider, model_id)
+        except OmpCommandError as exc:
+            _logger.warning(
+                "OMP-native model persistence failed for session=%s",
+                conv_id,
+                exc_info=True,
+            )
+            await _omp_native_revert_session_field(
+                conv_id,
+                field="model_override",
+                previous_value=previous_model,
+            )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "omp_native_model_persist_failed",
+                    "detail": _client_safe_error_detail(
+                        exc, context="omp-native model persistence"
+                    ),
+                },
+            )
+
+        await _omp_native_patch_session_field(conv_id, field="model_override", value=selected)
+        return Response(status_code=204)
+
+    async def _handle_omp_native_effort_change(
+        conv_id: str,
+        effort: str | None,
+    ) -> Response:
+        from omnigent.omp_config import OmpCommandError, persist_omp_thinking_level
+        from omnigent.omp_native_bridge import bridge_dir_for_session_id
+        from omnigent.omp_native_terminal import OmpNativeTerminalClient
+
+        if effort is None or not effort.strip():
+            return Response(status_code=204)
+        selected = effort.strip()
+        snapshot = await _omp_native_session_snapshot(conv_id)
+        profile = _omp_profile_from_snapshot(snapshot)
+        previous_effort = snapshot.get("reasoning_effort") if isinstance(snapshot, dict) else None
+        bridge_dir = bridge_dir_for_session_id(conv_id)
+        client = OmpNativeTerminalClient(bridge_dir)
+        try:
+            await asyncio.wait_for(client.connect(), timeout=10.0)
+            response = await client.send_command(
+                {"type": "set_thinking_level", "level": selected}, wait=True
+            )
+            frame = response.get("frame") if isinstance(response, dict) else None
+            if not isinstance(frame, dict) or not frame.get("success"):
+                error = frame.get("error") if isinstance(frame, dict) else "rejected"
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": "omp_native_effort_failed",
+                        "detail": f"OMP set_thinking_level failed: {error}",
+                    },
+                )
+        except (RuntimeError, asyncio.TimeoutError, OSError) as exc:
+            _logger.warning(
+                "OMP-native effort change failed for session=%s", conv_id, exc_info=True
+            )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "omp_native_effort_failed",
+                    "detail": _client_safe_error_detail(exc, context="omp-native effort change"),
+                },
+            )
+        finally:
+            await client.close()
+
+        try:
+            await asyncio.to_thread(persist_omp_thinking_level, profile, selected)
+        except OmpCommandError as exc:
+            _logger.warning(
+                "OMP-native effort persistence failed for session=%s",
+                conv_id,
+                exc_info=True,
+            )
+            await _omp_native_revert_session_field(
+                conv_id,
+                field="reasoning_effort",
+                previous_value=previous_effort,
+            )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "omp_native_effort_persist_failed",
+                    "detail": _client_safe_error_detail(
+                        exc, context="omp-native effort persistence"
+                    ),
+                },
+            )
+
+        await _omp_native_patch_session_field(
+            conv_id, field="reasoning_effort", value=selected
+        )
+        return Response(status_code=204)
+
+    async def _omp_native_session_snapshot(conv_id: str) -> dict[str, Any]:
+        if server_client is None:
+            return {}
+        try:
+            resp = await server_client.get(
+                f"/v1/sessions/{urllib.parse.quote(conv_id, safe='')}",
+                timeout=10.0,
+            )
+        except (httpx.HTTPError, RuntimeError, ValueError):
+            return {}
+        if resp.status_code != 200:
+            return {}
+        snapshot = resp.json()
+        return snapshot if isinstance(snapshot, dict) else {}
+
+    def _omp_profile_from_snapshot(snapshot: dict[str, Any]) -> str | None:
+        labels = snapshot.get("labels") if isinstance(snapshot, dict) else None
+        if isinstance(labels, dict):
+            profile = labels.get("omnigent.omp.profile")
+            if isinstance(profile, str) and profile:
+                return profile
+        return None
+
+    async def _omp_native_patch_session_field(
+        conv_id: str,
+        *,
+        field: str,
+        value: str | None,
+    ) -> None:
+        if server_client is None:
+            return
+        # The PATCH endpoint treats "default" / "off" / "reset" as a clear
+        # alias for an override field. Use it when reverting to no override.
+        body: dict[str, Any] = {field: value if value is not None else "default"}
+        try:
+            await server_client.patch(
+                f"/v1/sessions/{urllib.parse.quote(conv_id, safe='')}",
+                json=body,
+                timeout=10.0,
+            )
+        except (httpx.HTTPError, RuntimeError, ValueError):
+            _logger.warning(
+                "Failed to patch OMP-native session %s field %s", conv_id, field, exc_info=True
+            )
+
+    async def _omp_native_revert_session_field(
+        conv_id: str,
+        *,
+        field: str,
+        previous_value: str | None,
+    ) -> None:
+        await _omp_native_patch_session_field(conv_id, field=field, value=previous_value)
 
     async def _teardown_session_terminals(conv_id: str) -> None:
         from omnigent.entities.session_resources import terminal_resource_id
@@ -6848,7 +7058,7 @@ def create_runner_app(
 
         if body_type == "effort_change":
             harness = _session_harness_name(conversation_id)
-            if harness in ("claude-native", "codex-native"):
+            if harness in ("claude-native", "codex-native", "omp-native"):
                 effort = body.get("effort") if isinstance(body, dict) else None
                 if effort is not None and not isinstance(effort, str):
                     return JSONResponse(
@@ -6862,6 +7072,11 @@ def create_runner_app(
                     return await _handle_codex_native_settings_update(
                         conversation_id,
                         {"effort": effort},
+                    )
+                if harness == "omp-native":
+                    return await _handle_omp_native_effort_change(
+                        conversation_id,
+                        effort,
                     )
                 return await _handle_claude_native_effort_change(
                     conversation_id,
@@ -6878,6 +7093,7 @@ def create_runner_app(
                 "opencode-native",
                 "kiro-native",
                 "pi-native",
+                "omp-native",
             ):
                 model = body.get("model") if isinstance(body, dict) else None
                 if model is not None and not isinstance(model, str):
@@ -6912,6 +7128,11 @@ def create_runner_app(
                     )
                 if harness == "pi-native":
                     return await _handle_pi_native_model_change(
+                        conversation_id,
+                        model,
+                    )
+                if harness == "omp-native":
+                    return await _handle_omp_native_model_change(
                         conversation_id,
                         model,
                     )
@@ -7288,6 +7509,7 @@ def create_runner_app(
                 "claude": _claude_terminal_ensure_locks,
                 "codex": _codex_terminal_ensure_locks,
                 "pi": _pi_terminal_ensure_locks,
+                "omp": _omp_terminal_ensure_locks,
                 "cursor": _cursor_terminal_ensure_locks,
                 "kiro": _kiro_terminal_ensure_locks,
                 "antigravity": _antigravity_terminal_ensure_locks,
@@ -7383,8 +7605,8 @@ def create_runner_app(
                     "and could not be closed."
                 )
 
-            elif terminal_name in ("pi", "opencode"):
-                # pi/opencode resolve the spec unwrapped — a resolution error
+            elif terminal_name in ("pi", "opencode", "omp"):
+                # pi/opencode/omp resolve the spec unwrapped — a resolution error
                 # surfaces as a terminal-start error (the resolver does not
                 # swallow it).
                 async def _spec_ensure_build(
@@ -8538,6 +8760,72 @@ def create_runner_app(
         }
         return JSONResponse(status_code=200, content={"models": models})
 
+    @app.get("/v1/sessions/{session_id}/omp-model-options")
+    async def get_session_omp_model_options(session_id: str) -> JSONResponse:
+        if _session_harness_name(session_id) != "omp-native":
+            return JSONResponse(status_code=200, content={"models": []})
+        from omnigent.omp_native_bridge import bridge_dir_for_session_id
+        from omnigent.omp_native_terminal import OmpNativeTerminalClient
+
+        bridge_dir = bridge_dir_for_session_id(session_id)
+        client = OmpNativeTerminalClient(bridge_dir)
+        try:
+            await asyncio.wait_for(client.connect(), timeout=10.0)
+            response = await client.send_command(
+                {"type": "get_available_models"}, wait=True
+            )
+            frame = response.get("frame") if isinstance(response, dict) else None
+            if not isinstance(frame, dict) or not frame.get("success"):
+                error = frame.get("error") if isinstance(frame, dict) else "not ready"
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": "omp_native_model_options_failed",
+                        "detail": f"OMP model catalog not ready: {error}",
+                    },
+                )
+            data = frame.get("data", {})
+            models = data.get("models") if isinstance(data, dict) else []
+            if not isinstance(models, list):
+                models = []
+            options: list[dict[str, Any]] = []
+            for entry in models:
+                if not isinstance(entry, dict):
+                    continue
+                provider = entry.get("provider")
+                model_id = entry.get("id")
+                if not isinstance(provider, str) or not isinstance(model_id, str):
+                    continue
+                options.append(
+                    {
+                        "id": f"{provider}/{model_id}",
+                        "displayName": entry.get("displayName")
+                        or entry.get("name")
+                        or model_id,
+                        **(
+                            {"providerName": entry.get("providerName")}
+                            if entry.get("providerName")
+                            else {}
+                        ),
+                    }
+                )
+            return JSONResponse(status_code=200, content={"models": options})
+        except (RuntimeError, asyncio.TimeoutError, OSError) as exc:
+            _logger.warning(
+                "OMP-native model options failed for session=%s", session_id, exc_info=True
+            )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "omp_native_model_options_failed",
+                    "detail": _client_safe_error_detail(
+                        exc, context="omp-native model options"
+                    ),
+                },
+            )
+        finally:
+            await client.close()
+
     @app.get("/v1/sessions/{session_id}/claude-model-options")
     async def get_session_claude_model_options(session_id: str) -> JSONResponse:
         if _session_harness_name(session_id) != "claude-native":
@@ -8802,6 +9090,7 @@ def create_runner_app(
         _codex_terminal_ensure_locks.pop(session_id, None)
         _claude_terminal_ensure_locks.pop(session_id, None)
         _pi_terminal_ensure_locks.pop(session_id, None)
+        _omp_terminal_ensure_locks.pop(session_id, None)
         _cursor_terminal_ensure_locks.pop(session_id, None)
         _kiro_terminal_ensure_locks.pop(session_id, None)
         _antigravity_terminal_ensure_locks.pop(session_id, None)
@@ -8829,6 +9118,7 @@ def create_runner_app(
         _codex_terminal_ensure_locks.pop(session_id, None)
         _claude_terminal_ensure_locks.pop(session_id, None)
         _pi_terminal_ensure_locks.pop(session_id, None)
+        _omp_terminal_ensure_locks.pop(session_id, None)
         _cursor_terminal_ensure_locks.pop(session_id, None)
         _kiro_terminal_ensure_locks.pop(session_id, None)
         _antigravity_terminal_ensure_locks.pop(session_id, None)
@@ -9710,6 +10000,7 @@ def _build_spawn_env_from_spec(
             _build_goose_spawn_env,
             _build_hermes_spawn_env,
             _build_kimi_spawn_env,
+            _build_omp_spawn_env,
             _build_openai_agents_sdk_spawn_env,
             _build_pi_spawn_env,
             _build_qwen_spawn_env,
@@ -9721,6 +10012,8 @@ def _build_spawn_env_from_spec(
             env = _build_codex_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
         elif harness == "pi":
             env = _build_pi_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
+        elif harness == "omp":
+            env = _build_omp_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
         elif harness == "openai-agents":
             env = _build_openai_agents_sdk_spawn_env(effective_spec)
         elif harness == "cursor":
