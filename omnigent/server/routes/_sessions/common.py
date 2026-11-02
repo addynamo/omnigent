@@ -30,6 +30,7 @@ from omnigent.harness_plugins import (
     CURSOR_NATIVE_CODING_AGENT,
     KIMI_NATIVE_CODING_AGENT,
     KIRO_NATIVE_CODING_AGENT,
+    OMP_NATIVE_CODING_AGENT,
     OPENCODE_NATIVE_CODING_AGENT,
     PI_NATIVE_CODING_AGENT,
     harness_capabilities,
@@ -291,6 +292,9 @@ _ANTIGRAVITY_NATIVE_HARNESS = ANTIGRAVITY_NATIVE_CODING_AGENT.harness
 
 
 _KIRO_NATIVE_WRAPPER_LABEL_VALUE = KIRO_NATIVE_CODING_AGENT.wrapper_label
+
+
+_OMP_NATIVE_WRAPPER_LABEL_VALUE = OMP_NATIVE_CODING_AGENT.wrapper_label
 
 
 _PI_NATIVE_WRAPPER_LABEL_VALUE = PI_NATIVE_CODING_AGENT.wrapper_label
@@ -712,6 +716,7 @@ _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER: dict[str, str] = {
     _CURSOR_NATIVE_WRAPPER_LABEL_VALUE: "cursor-model-options",
     _KIRO_NATIVE_WRAPPER_LABEL_VALUE: "kiro-model-options",
     _OPENCODE_NATIVE_WRAPPER_LABEL_VALUE: "codex-model-options",
+    _OMP_NATIVE_WRAPPER_LABEL_VALUE: "omp-model-options",
     # pi-native is deliberately NOT here: its catalog is PUSHED by the resident
     # extension (``external_model_options`` → ``_pushed_model_options_cache``),
     # not fetched from a runner route, so the picker works in every auth path
@@ -885,6 +890,7 @@ __all__ = [
     "_NATIVE_POLICY_NOT_ENFORCED_CODE",
     "_NATIVE_TERMINAL_ENSURE_FAILED_CODE",
     "_NATIVE_TERMINAL_START_FAILED_CODE",
+    "_OMP_NATIVE_WRAPPER_LABEL_VALUE",
     "_OPENCODE_NATIVE_WRAPPER_LABEL_VALUE",
     "_PI_NATIVE_WRAPPER_LABEL_VALUE",
     "_RACE_TASK_REAP_TIMEOUT_S",

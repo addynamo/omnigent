@@ -2361,6 +2361,31 @@ class HostProcess:
                 models=pi_models,
             )
 
+        if harness == "omp-native":
+            try:
+                from omnigent.omp_config import list_omp_models
+
+                omp_models = await asyncio.to_thread(list_omp_models, None)
+            except Exception:
+                _logger.exception("Failed to resolve pre-launch OMP model options")
+                return HostModelOptionsResultFrame(
+                    request_id=frame.request_id,
+                    status="failed",
+                    error="failed to resolve OMP model options",
+                )
+            return HostModelOptionsResultFrame(
+                request_id=frame.request_id,
+                status="ok",
+                models=[
+                    {
+                        "id": f"{model.provider}/{model.model_id}",
+                        "displayName": model.display_name,
+                        **({"providerName": model.provider_name} if model.provider_name else {}),
+                    }
+                    for model in omp_models
+                ],
+            )
+
         if harness != "claude-native":
             return HostModelOptionsResultFrame(
                 request_id=frame.request_id,

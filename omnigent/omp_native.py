@@ -7,10 +7,10 @@ import json
 import logging
 import os
 import shlex
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Sequence
 
 import click
 import httpx
@@ -28,7 +28,6 @@ from omnigent.host.daemon_launch import (
     wait_for_host_online,
     wait_for_runner_online,
 )
-from omnigent.inner.omp_executor import resolve_omp_executable
 from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.native_coding_agents import native_shell_terminal_spec
 from omnigent.native_terminal import (
@@ -47,7 +46,6 @@ from omnigent.native_terminal import (
 from omnigent.native_terminal import url_component
 from omnigent.omp_native_bridge import (
     OmpNativeResumeError,
-    OmpRpcBridge,
     bridge_dir_for_session_id,
     omp_rpc_command,
 )
@@ -311,7 +309,7 @@ def _run_with_remote_server(
             return
 
         async def _drive() -> None:
-            from omnigent._runner_startup import RunnerStartupProgress, runner_startup_progress
+            from omnigent._runner_startup import runner_startup_progress
 
             with runner_startup_progress(initial_message="Preparing OMP...") as progress:
                 _update_startup_progress(progress, "Connecting to local daemon...")
@@ -325,7 +323,7 @@ def _run_with_remote_server(
                     session_bundle=bundle,
                     terminal_launch_args=terminal_launch_args,
                     profile=profile,
-                    prompt=prompt,
+                    _prompt=prompt,
                     host_id=host_id,
                     workspace=str(Path.cwd().resolve()),
                     startup_progress=progress,
@@ -362,12 +360,11 @@ async def _prepare_omp_terminal_via_daemon(
     session_bundle: bytes | None,
     terminal_launch_args: tuple[str, ...],
     profile: str | None,
-    prompt: str | None,
+    _prompt: str | None,
     host_id: str,
     workspace: str,
     startup_progress: object | None = None,
 ) -> PreparedOmpTerminal:
-    from omnigent.runner.app import _pi_native_launch_config
 
     persist_args = list(terminal_launch_args)
     timeout = httpx.Timeout(30.0, read=120.0)
@@ -459,11 +456,12 @@ async def _create_omp_session(
     terminal_launch_args: list[str] | None = None,
     profile: str | None = None,
 ) -> str:
-    metadata: _JsonObject = {"labels": dict(_SESSION_LABELS)}
+    labels = dict(_SESSION_LABELS)
+    if profile is not None:
+        labels["omnigent.omp.profile"] = profile
+    metadata: _JsonObject = {"labels": labels}
     if terminal_launch_args:
         metadata["terminal_launch_args"] = terminal_launch_args
-    if profile is not None:
-        metadata["profile"] = profile
     resp = await client.post(
         "/v1/sessions",
         data={"metadata": json.dumps(metadata)},
@@ -678,14 +676,14 @@ def omp_native_bridge_dir_for_session(session_id: str) -> Path:
 
 
 __all__ = [
-    "LaunchedOmpTerminal",
-    "OmpNativeLaunch",
-    "OmpNativeResumeError",
-    "PreparedOmpTerminal",
     "_AGENT_NAME",
     "_TERMINAL_NAME",
     "_TERMINAL_SESSION_KEY",
     "_WRAPPER_LABEL_VALUE",
+    "LaunchedOmpTerminal",
+    "OmpNativeLaunch",
+    "OmpNativeResumeError",
+    "PreparedOmpTerminal",
     "_materialize_omp_agent_spec",
     "build_omp_native_launch",
     "omp_native_bridge_dir_for_session",
