@@ -2,17 +2,17 @@
 
 polly is the standalone multi-agent coding orchestrator (successor to the
 deleted nessie example, whose deep structural pins were folded in here).
-Loads the bundle and asserts the distinctive wiring stays intact: the
-claude-sdk orchestrator brain, the seven cross-vendor coding sub-agents
-(claude_code / codex / opencode / cursor / hermes / agy / pi, which implement,
-review, and explore),
-the three spine skills, and the bounds/blast-radius guardrails. Pure spec-load
-— no LLM, no credentials.
+Loads the bundle and asserts the distinctive wiring stays intact: the headless
+``omp`` orchestrator brain, the default ``omp`` coding sub-agent, the optional
+legacy workers (``claude_code``, ``codex``, ``opencode``, ``cursor``,
+``hermes``, ``agy``, ``pi``) available for explicit ``args.model`` overrides and
+cross-vendor review, the three spine skills, and the bounds/blast-radius
+guardrails. Pure spec-load — no LLM, no credentials.
 
 What breaks if this fails:
 - the orchestrator substrate drifts (model / harness / context window),
-- a coding sub-agent is dropped or its harness changes (no implementers, or
-  two collapse onto one vendor → cross-vendor review blind spot),
+- the default ``omp`` coding sub-agent is dropped or its harness changes,
+- optional workers become unavailable for explicit overrides,
 - a spine skill is dropped or renamed (the strategy layer regresses),
 - a guardrail is removed (unbounded fan-out, or ungated push/deploy).
 """
@@ -38,11 +38,9 @@ def polly_spec() -> AgentSpec:
 
 def test_orchestrator_executor(polly_spec: AgentSpec) -> None:
     """
-    The orchestrator runs on claude-sdk with a 1M window and **no pinned
-    model or profile**, so it inherits whatever Claude provider the user
-    configured via ``omnigent setup --no-internal-beta`` (Anthropic key,
-    subscription, gateway, or Databricks) and resolves that provider's
-    default Claude model.
+    The orchestrator runs on the headless ``omp`` harness with a 1M window
+    and **no pinned model or profile**, so it inherits whatever model OMP
+    resolves from the active profile or an explicit ``args.model`` override.
 
     Un-pinning is load-bearing for OSS (a Databricks-specific model id would
     404 on a plain Anthropic key). The old ``databricks-gpt-5-4`` fallback
@@ -58,8 +56,8 @@ def test_orchestrator_executor(polly_spec: AgentSpec) -> None:
     """
     assert polly_spec.name == "polly"
     ex = polly_spec.executor
-    assert ex.config.get("harness") == "claude-sdk"
-    # No model pin — the configured provider's default Claude model is used.
+    assert ex.config.get("harness") == "omp"
+    # No model pin — OMP's profile/default model is used.
     # Re-introducing a pin (Databricks or otherwise) fails here.
     assert ex.model is None
     # Profile is intentionally NOT pinned either.
@@ -69,16 +67,16 @@ def test_orchestrator_executor(polly_spec: AgentSpec) -> None:
 
 def test_coding_subagents(polly_spec: AgentSpec) -> None:
     """
-    The bundle has exactly seven coding sub-agents: ``claude_code`` (claude-native),
-    ``codex`` (codex-native), ``opencode`` (opencode-native), ``cursor``
-    (cursor-native), ``hermes`` (hermes-native), and ``agy`` (antigravity-native)
-    on the native terminal harnesses, plus ``pi`` (pi) as the headless
-    multi-model worker. All implement, review, and explore. The native
-    harnesses render terminal-first (Chat / Terminal pill) so the human can
-    watch or take over.
+    The bundle has ``omp`` as the default coding sub-agent on the headless
+    ``omp`` harness, plus the optional legacy terminal-first and headless
+    workers for explicit ``args.model`` overrides and cross-vendor review.
+    All implement, review, and explore. Native harnesses render
+    terminal-first so the human can watch or take over when explicitly
+    requested.
 
-    A missing/renamed agent means fewer implementers, and same-vendor harnesses
-    would break cross-vendor review — polly's differentiator.
+    A missing/renamed default agent means no default implementer; a harness
+    change on the default means polly would no longer use headless OMP by
+    default.
     """
     fam = {a.name: a.executor.config.get("harness") for a in polly_spec.sub_agents}
     assert sorted(polly_spec.tools.agents) == [
@@ -87,9 +85,11 @@ def test_coding_subagents(polly_spec: AgentSpec) -> None:
         "codex",
         "cursor",
         "hermes",
+        "omp",
         "opencode",
         "pi",
     ]
+    assert fam["omp"] == "omp"
     assert fam["claude_code"] == "claude-native"
     assert fam["codex"] == "codex-native"
     assert fam["opencode"] == "opencode-native"
@@ -97,33 +97,52 @@ def test_coding_subagents(polly_spec: AgentSpec) -> None:
     assert fam["hermes"] == "hermes-native"
     assert fam["agy"] == "antigravity-native"
     assert fam["pi"] == "pi"
-    # Seven distinct vendors → any implementer's diff is reviewable by another.
-    assert len(set(fam.values())) == 7
-    # Headless bypass knobs so workers don't stall on ApprovalCards.
     by_name = {a.name: a for a in polly_spec.sub_agents}
+    # No native bypass knobs on the default OMP worker — it's a headless harness.
+    assert by_name["omp"].executor.config.get("permission_mode") is None
+    assert by_name["omp"].executor.config.get("yolo") is None
+    assert by_name["omp"].executor.model is None
+    # Native bypass knobs remain on the terminal harnesses.
     assert by_name["claude_code"].executor.config.get("permission_mode") == "auto"
     assert by_name["claude_code"].executor.model is None
     assert by_name["codex"].executor.config.get("yolo") in (True, "True", "true")
     assert by_name["cursor"].executor.config.get("yolo") in (True, "True", "true")
     assert by_name["cursor"].executor.model == "grok-4.5"
-    for name in ("claude_code", "codex", "opencode", "cursor", "hermes", "agy", "pi"):
+    for name in ("omp", "claude_code", "codex", "opencode", "cursor", "hermes", "agy", "pi"):
         prompt = (_POLLY_BUNDLE / "agents" / name / "config.yaml").read_text(encoding="utf-8")
         assert "IMPLEMENT — write real product code" in prompt
         assert "REVIEW — verify another agent's diff" in prompt
         assert "EXPLORE / SEARCH — answer a specific question" in prompt
 
 
+def test_omp_subagent_is_headless_scaffold_worker(polly_spec: AgentSpec) -> None:
+    """
+    The default ``omp`` sub-agent is a headless scaffold-harness child: omp
+    harness, no pinned model/profile (so ``args.model`` per dispatch — and
+    otherwise the OMP profile default — decides), and an ``os_env`` block so
+    the bridged ``sys_os_*`` tools register and every shell call crosses the
+    policy layer (``blast_radius`` matches ``sys_os_shell``).
+
+    A pinned model would defeat the per-dispatch override point; a dropped
+    ``os_env`` would leave the default worker with no shell/file tools at all
+    (it would claim to explore but be unable to read anything).
+    """
+    omp = next(a for a in polly_spec.sub_agents if a.name == "omp")
+    assert omp.executor.config.get("harness") == "omp"
+    assert omp.executor.model is None
+    assert omp.executor.profile is None
+    # No native bypass knobs — omp is not a terminal harness.
+    assert omp.executor.config.get("permission_mode") is None
+    assert omp.executor.config.get("yolo") is None
+    assert omp.os_env is not None
+    assert omp.os_env.type == "caller_process"
+
+
 def test_pi_subagent_is_headless_scaffold_worker(polly_spec: AgentSpec) -> None:
     """
-    The ``pi`` sub-agent is a headless scaffold-harness child: pi harness,
-    no pinned model/profile (so ``args.model`` per dispatch — and otherwise
-    the provider default — decides), and an ``os_env`` block so the bridged
-    ``sys_os_*`` tools register and every shell call crosses the policy
-    layer (``blast_radius`` matches ``sys_os_shell``).
-
-    A pinned model would defeat the per-dispatch multi-model point; a
-    dropped ``os_env`` would leave the worker with no shell/file tools at
-    all (it would claim to explore but be unable to read anything).
+    The ``pi`` sub-agent remains a headless scaffold-harness child for
+    explicit overrides: pi harness, no pinned model/profile, and an ``os_env``
+    block so the bridged ``sys_os_*`` tools register.
     """
     pi = next(a for a in polly_spec.sub_agents if a.name == "pi")
     assert pi.executor.config.get("harness") == "pi"
@@ -165,15 +184,18 @@ def test_subagent_dispatch_text_advertises_task_titles_and_purpose(
         encoding="utf-8"
     )
 
+    config_compact = " ".join(config.split())
+    cross_review_compact = " ".join(cross_review.split())
+
     assert "args.purpose" in config
     assert "Every `sys_session_send` MUST set both" in config
     assert "Name the sub-agent session for the work it is doing" in config
-    assert "Bad titles are `claude_code`, `claude-code`, `codex`" in config
+    assert "Bad titles are `claude_code`, `claude-code`, `codex`, `pi`, `worker`, and" in config
     assert "Goal mode is opt-in for long-running IMPLEMENT dispatches" in config
-    assert "one standalone `/goal <condition>` command" in config
-    assert "do not invent a `sys_session_send` goal parameter" in config
-    assert "long-running `claude_code` or `codex` implementation" in fanout
-    assert "Do not use child goal mode for other workers" in fanout
+    assert "standalone `/goal <condition>` command" in config_compact
+    assert "do not invent a `sys_session_send` goal parameter" in config_compact
+    assert "long-running `omp` implementation" in fanout
+    assert "Do not use child goal mode for non-implementation purposes" in fanout
     assert 'purpose: "implement"' in fanout
     assert 'title="<task_slug>"' in fanout
     assert 'title="review-<task_slug>"' in cross_review
@@ -181,11 +203,10 @@ def test_subagent_dispatch_text_advertises_task_titles_and_purpose(
     assert 'purpose: "implement"' in cross_review
     assert 'purpose: "explore"' in investigate
     assert 'purpose: "search"' in investigate
-    config_compact = " ".join(config.split())
     assert "Collect finished worker results with `sys_read_inbox`" in config
     assert "do not use `sys_timer_set` or any delayed self-message" in config_compact
     assert "Collect its structured result with `sys_read_inbox`" in fanout
-    assert "structured report with `sys_read_inbox`" in cross_review
+    assert "collect the inbox-delivered structured report with `sys_read_inbox`" in cross_review_compact
     purpose_guard = next(
         p for p in polly_spec.guardrails.policies if p.name == "headless_subagent_purpose_guard"
     )
@@ -244,7 +265,7 @@ def test_polly_test_count_ground_truth_guidance() -> None:
     assert "miscount`, `over-report`, or `fabrication`" in config_compact
     assert "exact file set/command/commit" in cross_review_compact
 
-    for name in ("claude_code", "codex", "opencode", "cursor", "hermes", "agy", "pi"):
+    for name in ("omp", "claude_code", "codex", "opencode", "cursor", "hermes", "agy", "pi"):
         worker = (_POLLY_BUNDLE / "agents" / name / "config.yaml").read_text(encoding="utf-8")
         worker_compact = " ".join(worker.split())
         assert "When you report test results, include the exact command and file set" in (
@@ -347,10 +368,9 @@ def test_investigation_skill_delegates_read_only_work() -> None:
 
     assert "Use for any read-only task: investigation, debugging, audit" in compact
     assert (
-        "Dispatch each task to `claude_code`, `codex`, `opencode`, `cursor`, `hermes`, "
-        "`agy`, or `pi`: "
-        '`sys_session_send(agent="claude_code"|"codex"|"opencode"|"cursor"|"hermes"|"agy"|"pi", '
-        'title="explore-<task_slug>", '
+        "Dispatch each task to `omp` by default (or to the explicit worker named "
+        "in `args.model`): "
+        '`sys_session_send(agent="omp", title="explore-<task_slug>", '
         'args={purpose: "explore", input: "<question + exact scope + evidence requested>"})`'
     ) in compact
     # The audited skill (#3074) made task-based titles mandatory at dispatch.
@@ -391,6 +411,7 @@ def test_subagent_cancellation_guidance_present() -> None:
     assert "`claude_code` workers are hard-stopped" in config_compact
     assert "`codex` cancellation is currently best-effort" in config_compact
     assert "`agy` (`antigravity-native`) has no dedicated interrupt handler" in config_compact
+    assert "`omp`" in config_compact
 
     assert (
         "`sys_cancel_task` with `task_id` set to the recorded `conversation_id`"
@@ -421,7 +442,7 @@ def test_orchestrator_guardrails(polly_spec: AgentSpec) -> None:
 def test_subagent_guardrails(polly_spec: AgentSpec) -> None:
     """Each sub-agent carries the blast_radius gate (push/destructive)."""
     by_name = {a.name: a for a in polly_spec.sub_agents}
-    for name in ("claude_code", "codex", "opencode", "cursor", "hermes", "agy", "pi"):
+    for name in ("omp", "claude_code", "codex", "opencode", "cursor", "hermes", "agy", "pi"):
         guardrails = by_name[name].guardrails
         assert guardrails is not None, name
         assert [p.name for p in guardrails.policies] == ["blast_radius"], name
@@ -454,6 +475,6 @@ def test_function_policies_have_nonempty_arguments(polly_spec: AgentSpec) -> Non
             )
             checked += 1
     # orchestrator: blast_radius + spawn_bounds + headless_subagent_purpose_guard
-    # = 3; sub-agents: blast_radius x7 (claude_code, codex, opencode, cursor,
-    # hermes, agy, pi) = 7 -> 10 total. Fewer = a policy dropped.
-    assert checked == 10, f"expected 10 function policies in the bundle, inspected {checked}"
+    # = 3; sub-agents: blast_radius x8 (omp, claude_code, codex, opencode,
+    # cursor, hermes, agy, pi) = 8 -> 11 total. Fewer = a policy dropped.
+    assert checked == 11, f"expected 11 function policies in the bundle, inspected {checked}"

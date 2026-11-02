@@ -12,17 +12,17 @@ repository-specific technical question.
 ## Procedure
 1. Decompose the question into one or more bounded investigation tasks. Prefer
    two independent lenses for ambiguous or high-stakes questions.
-2. Dispatch each task to `claude_code`, `codex`, `opencode`, `cursor`, `hermes`, `agy`, or `pi`:
-   `sys_session_send(agent="claude_code"|"codex"|"opencode"|"cursor"|"hermes"|"agy"|"pi",
-   title="explore-<task_slug>", args={purpose: "explore", input: "<question +
-   exact scope + evidence requested>"})`. Use a task-based title such as
-   `explore-ci-flake`, never the raw vendor name. Use `purpose: "search"` only
-   when the task is primarily external/document search. Prefer `pi` when a
-   third lens or a non-Claude/GPT model is wanted. Any worker takes an optional
-   `args.model` (`sys_list_models` shows what each worker can run; an invalid
-   model/worker combination fails loud at dispatch, and `model` only applies on
-   the dispatch that CREATES the session — a send that continues an existing
-   title rejects it).
+2. Dispatch each task to `omp` by default (or to the explicit worker named
+   in `args.model`):
+   `sys_session_send(agent="omp", title="explore-<task_slug>",
+   args={purpose: "explore", input: "<question + exact scope + evidence
+   requested>"})`. Use a task-based title such as `explore-ci-flake`, never
+   the raw vendor name. Use `purpose: "search"` only when the task is
+   primarily external/document search. `omp` takes an optional `args.model`
+   (`sys_list_models` shows what it can run; an invalid model/worker
+   combination fails loud at dispatch, and `model` only applies on the dispatch
+   that CREATES the session — a send that continues an existing title rejects
+   it).
    Tell the worker to edit nothing and return file,
    command, URL, or line evidence. Emit these `sys_session_send` calls in the
    SAME turn — do not end a turn having only said you will dispatch.

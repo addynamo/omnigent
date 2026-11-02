@@ -330,6 +330,20 @@ def local_polly_server(tmp_path: Path) -> Iterator[str]:
             proc.kill()
 
 
+def test_polly_source_defaults_to_omp_harness() -> None:
+    """The shipped polly bundle defaults to the headless ``omp`` harness.
+
+    The e2e test below rewrites the executor to ``openai-agents`` to exercise
+    the mock LLM path; this separate assertion guards the real default so it
+    cannot silently drift back to ``claude-sdk``.
+    """
+    raw = (_POLLY / "config.yaml").read_text(encoding="utf-8")
+    spec = yaml.safe_load(raw)
+    assert spec.get("executor", {}).get("config", {}).get("harness") == "omp"
+    # Explicit harness/model overrides remain authoritative, so the e2e rewrite
+    # below is allowed to change this value.
+
+
 def test_polly_orchestrator_boots_and_responds(
     local_polly_server: str,
     mock_llm_server_url: str,
@@ -345,6 +359,10 @@ def test_polly_orchestrator_boots_and_responds(
     a turn completes. A blank reply here is the exact failure that masqueraded
     as "no output" before the auth fix — so this is the regression guard for
     the substrate.
+
+    This also exercises the explicit-harness-override path: the source bundle
+    now defaults to ``omp``, but we rewrite it to ``openai-agents`` for the mock
+    LLM and the run still completes.
 
     :param local_polly_server: Base URL of the in-tree local server fixture.
     :param mock_llm_server_url: Base URL of the mock LLM server fixture.
