@@ -104,6 +104,9 @@ _HTTP_TRANSIENT_STATUS_CODES = {408, 409, 425, 429}
 # shared server. The budget spans the backoff schedule (capped at 30 s) ⇒ a few
 # minutes, comfortably covering the dispatch race.
 _SUBAGENT_DELIVERY_NOT_CONFIRMED_MAX_ATTEMPTS = 12
+# Caps the backoff exponent so ``2 ** attempts`` cannot overflow a float.
+_HTTP_POST_RETRY_MAX_EXPONENT = 16
+_SUBAGENT_DELIVERY_NOT_CONFIRMED_ERROR = "subagent_delivery_not_confirmed"
 _SUPERVISOR_INITIAL_BACKOFF_S = 1.0
 _SUPERVISOR_MAX_BACKOFF_S = 30.0
 _SUPERVISOR_HEALTHY_UPTIME_S = 60.0
@@ -613,6 +616,27 @@ class _PostRetryDecision:
     permanent: bool
 
 
+class _ForwarderSessionGoneError(Exception):
+    """
+    Raised when Omnigent permanently refuses posts for the forwarder's session.
+
+    The session was deleted (404), so no retry can succeed.
+    :func:`supervise_forwarder` stops on it.
+
+    :param reason: Short description for the log, e.g. ``"http 404"``.
+    """
+
+    def __init__(self, reason: str) -> None:
+        """
+        Store the reason the forwarder is stopping.
+
+        :param reason: Short description for the log, e.g. ``"http 404"``.
+        :returns: None.
+        """
+        super().__init__(reason)
+        self.reason = reason
+
+
 class _PostRetryTracker:
     """
     Track bounded retries and backoff for Omnigent event posts.
@@ -635,6 +659,7 @@ class _PostRetryTracker:
         max_not_confirmed_attempts: int = _SUBAGENT_DELIVERY_NOT_CONFIRMED_MAX_ATTEMPTS,
         base_delay_s: float = _HTTP_POST_RETRY_BASE_DELAY_S,
         max_delay_s: float = _HTTP_POST_RETRY_MAX_DELAY_S,
+        stop_on_session_gone: bool = False,
     ) -> None:
         """
         Initialize an empty retry tracker.
@@ -645,8 +670,12 @@ class _PostRetryTracker:
             ``subagent_delivery_not_confirmed`` 503 is exhausted.
         :param base_delay_s: Initial retry delay in seconds.
         :param max_delay_s: Maximum retry delay in seconds.
+        :param stop_on_session_gone: Raise :class:`_ForwarderSessionGoneError`
+            on a session-gone failure. Set only for posts to the forwarder's
+            own session, so a dead child session cannot stop the parent.
         :returns: None.
         """
+        self._stop_on_session_gone = stop_on_session_gone
         self._max_permanent_attempts = max(1, max_permanent_attempts)
         self._max_not_confirmed_attempts = max(1, max_not_confirmed_attempts)
         self._base_delay_s = max(0.0, base_delay_s)
@@ -688,7 +717,14 @@ class _PostRetryTracker:
         :param key: Stable retry key, e.g. ``"item:source-1"``.
         :param exc: HTTP exception raised while posting the event.
         :returns: Retry decision for this failure.
+        :raises _ForwarderSessionGoneError: If ``stop_on_session_gone`` is set
+            and the failure means the session can never accept posts.
         """
+        if self._stop_on_session_gone:
+            gone_reason = _session_gone_reason(exc)
+            if gone_reason is not None:
+                self._entries.pop(key, None)
+                raise _ForwarderSessionGoneError(gone_reason)
         # Count every failed post (transient or permanent) so a sustained
         # outage escalates once to a degraded-sync signal (#1120).
         _note_forward_failure(key)
@@ -711,7 +747,8 @@ class _PostRetryTracker:
                 permanent=permanent,
             )
         delay_s = min(
-            self._base_delay_s * (2 ** max(0, entry.attempts - 1)),
+            self._base_delay_s
+            * (2 ** min(max(0, entry.attempts - 1), _HTTP_POST_RETRY_MAX_EXPONENT)),
             self._max_delay_s,
         )
         entry.next_attempt_at = time.monotonic() + delay_s
@@ -781,8 +818,8 @@ async def forward_claude_transcript_to_session(
     # prevents re-reads on the normal path.
     delta_state = _read_delta_forward_state(bridge_dir)
     seen_delta_keys: dict[tuple[str, int], None] = {}
-    item_retries = _PostRetryTracker()
-    status_retries = _PostRetryTracker()
+    item_retries = _PostRetryTracker(stop_on_session_gone=True)
+    status_retries = _PostRetryTracker(stop_on_session_gone=True)
     subagent_start_retries = _PostRetryTracker()
     subagent_item_retries = _PostRetryTracker()
     subagent_status_retries = _PostRetryTracker()
@@ -855,8 +892,8 @@ async def forward_claude_transcript_to_session(
                         # under the rotated session's dir.
                         subagent_state = SubagentForwardState(subagents={})
                         await _write_subagent_forward_state_async(bridge_dir, subagent_state)
-                        item_retries = _PostRetryTracker()
-                        status_retries = _PostRetryTracker()
+                        item_retries = _PostRetryTracker(stop_on_session_gone=True)
+                        status_retries = _PostRetryTracker(stop_on_session_gone=True)
                         subagent_start_retries = _PostRetryTracker()
                         subagent_item_retries = _PostRetryTracker()
                         subagent_status_retries = _PostRetryTracker()
@@ -891,8 +928,8 @@ async def forward_claude_transcript_to_session(
                         # under the rotated session's dir.
                         subagent_state = SubagentForwardState(subagents={})
                         await _write_subagent_forward_state_async(bridge_dir, subagent_state)
-                        item_retries = _PostRetryTracker()
-                        status_retries = _PostRetryTracker()
+                        item_retries = _PostRetryTracker(stop_on_session_gone=True)
+                        status_retries = _PostRetryTracker(stop_on_session_gone=True)
                         subagent_start_retries = _PostRetryTracker()
                         subagent_item_retries = _PostRetryTracker()
                         subagent_status_retries = _PostRetryTracker()
@@ -1012,7 +1049,7 @@ async def forward_claude_transcript_to_session(
                             bridge_dir=bridge_dir,
                             dedupe=dedupe,
                         )
-            except asyncio.CancelledError:
+            except (asyncio.CancelledError, _ForwarderSessionGoneError):
                 raise
             except TimeoutError:
                 # The deadline cancelled a stalled await mid-iteration; the
@@ -2020,6 +2057,15 @@ async def supervise_forwarder(
             )
         except asyncio.CancelledError:
             raise
+        except _ForwarderSessionGoneError as gone:
+            _logger.warning(
+                "Stopping Claude transcript forwarder; Omnigent permanently "
+                "refuses posts for this session (%s); session=%s bridge_dir=%s",
+                gone.reason,
+                session_id,
+                bridge_dir,
+            )
+            return
         except Exception as exc:  # noqa: BLE001 — supervisor restarts on any Exception
             crash_exc = exc
         run_duration_s = _supervisor_monotonic() - run_started_at
@@ -4709,7 +4755,29 @@ def _is_subagent_delivery_not_confirmed(exc: httpx.HTTPError) -> bool:
         body = exc.response.json()
     except Exception:  # noqa: BLE001 — best-effort body parse
         return False
-    return isinstance(body, dict) and body.get("error") == "subagent_delivery_not_confirmed"
+    if not isinstance(body, dict):
+        return False
+    error = body.get("error")
+    if error == _SUBAGENT_DELIVERY_NOT_CONFIRMED_ERROR:
+        return True
+    # The server re-wraps the runner's body into ``error.message``.
+    message = error.get("message") if isinstance(error, dict) else None
+    return isinstance(message, str) and _SUBAGENT_DELIVERY_NOT_CONFIRMED_ERROR in message
+
+
+def _session_gone_reason(exc: httpx.HTTPError) -> str | None:
+    """
+    Return why posts to this session can never succeed, if they cannot.
+
+    A missing parent inbox is not terminal: the runner can restore it, so
+    that 503 stays on the bounded ``subagent_delivery_not_confirmed`` retry.
+
+    :param exc: HTTP exception raised while posting an Omnigent event.
+    :returns: ``"http 404"`` for a missing session, otherwise ``None``.
+    """
+    if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 404:
+        return "http 404"
+    return None
 
 
 def _http_status_for_log(exc: httpx.HTTPError) -> int | None:
