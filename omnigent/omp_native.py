@@ -7,7 +7,7 @@ import json
 import logging
 import os
 import shlex
-from collections.abc import Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -17,6 +17,7 @@ import httpx
 import yaml
 
 from omnigent._native_resume_hint import echo_native_resume_hint
+from omnigent._runner_startup import RunnerStartupProgress
 from omnigent._wrapper_labels import OMP_NATIVE_WRAPPER_VALUE as _WRAPPER_LABEL_VALUE
 from omnigent._wrapper_labels import WRAPPER_LABEL_KEY as _WRAPPER_LABEL_KEY
 from omnigent.conversation_browser import conversation_url, open_conversation_link_if_enabled
@@ -49,6 +50,7 @@ from omnigent.omp_native_bridge import (
     bridge_dir_for_session_id,
     omp_rpc_command,
 )
+from omnigent.omp_native_terminal import OmpNativeTerminalClient
 
 _logger = logging.getLogger(__name__)
 
@@ -93,7 +95,7 @@ class PreparedOmpTerminal:
     reattached: bool
 
 
-def _configured_omp_command(env: dict[str, str]) -> str:
+def _configured_omp_command(env: Mapping[str, str]) -> str:
     value = env.get(_OMP_PATH_ENV, "").strip()
     if value:
         return value
@@ -108,8 +110,8 @@ def _configured_omp_command(env: dict[str, str]) -> str:
 
 def resolve_omp_executable_path(
     *,
-    env: dict[str, str] | None = None,
-    which: callable | None = None,
+    env: Mapping[str, str] | None = None,
+    which: Callable[[str], str | None] | None = None,
 ) -> str:
     """Resolve the native OMP executable for the CLI wrapper.
 
@@ -363,7 +365,7 @@ async def _prepare_omp_terminal_via_daemon(
     _prompt: str | None,
     host_id: str,
     workspace: str,
-    startup_progress: object | None = None,
+    startup_progress: RunnerStartupProgress | None = None,
 ) -> PreparedOmpTerminal:
 
     persist_args = list(terminal_launch_args)
@@ -440,6 +442,8 @@ async def _prepare_omp_terminal_via_daemon(
             timeout_s=_DAEMON_TERMINAL_READY_TIMEOUT_S,
         )
         _update_startup_progress(startup_progress, "OMP terminal ready.")
+        if _prompt:
+            await _inject_omp_initial_prompt(session_id, _prompt)
     return PreparedOmpTerminal(
         session_id=session_id,
         terminal_id=terminal.terminal_id,
@@ -648,11 +652,24 @@ def _resolve_session_id_for_resume(
 
 
 def _update_startup_progress(
-    startup_progress: object | None,
+    startup_progress: RunnerStartupProgress | None,
     message: str,
 ) -> None:
     if startup_progress is not None:
         startup_progress.update(message)
+
+
+async def _inject_omp_initial_prompt(session_id: str, prompt: str) -> None:
+    """Forward the CLI ``--prompt`` value into the running OMP bridge."""
+    bridge_dir = bridge_dir_for_session_id(session_id)
+    client = OmpNativeTerminalClient(bridge_dir)
+    try:
+        await asyncio.wait_for(client.connect(), timeout=10.0)
+        await client.send_command({"type": "prompt", "message": prompt}, wait=False)
+    except (RuntimeError, asyncio.TimeoutError, OSError) as exc:
+        _logger.warning("Could not inject initial OMP prompt for %s: %s", session_id, exc)
+    finally:
+        await client.close()
 
 
 def _preflight_local_tools() -> None:

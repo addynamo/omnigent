@@ -45,7 +45,11 @@ async def _fake_bridge_handler(
     token: str,
     started: asyncio.Event,
 ) -> None:
-    """Authenticate, ack the prompt, then stream a short OMP turn."""
+    """Authenticate, then stream events and command responses like the real bridge.
+
+    The real bridge broadcasts ``event`` frames before the matching
+    ``command_response`` for a ``wait=True`` command, so this fake does too.
+    """
     try:
         first = await _read_json_line(reader)
         if first.get("type") != "authenticate" or first.get("token") != token:
@@ -53,60 +57,91 @@ async def _fake_bridge_handler(
             return
         await _write_json_line(writer, {"type": "authenticated", "sessionId": "conv_omp"})
 
-        command = await _read_json_line(reader)
-        assert command.get("type") == "command"
-        payload = command.get("payload", {})
-        assert payload.get("type") == "prompt"
-        assert payload.get("message") == "hi"
+        while True:
+            command = await _read_json_line(reader)
+            if command.get("type") == "close":
+                return
+            assert command.get("type") == "command"
+            payload = command.get("payload", {})
+            cmd_type = payload.get("type")
+            if cmd_type == "set_system_prompt":
+                # Broadcast a stray event before the command response to exercise demux.
+                await _write_json_line(
+                    writer,
+                    {"type": "event", "frame": {"type": "noop"}},
+                )
+                await _write_json_line(
+                    writer,
+                    {
+                        "type": "command_response",
+                        "frame": {"type": "response", "success": True, "id": "sys1"},
+                    },
+                )
+                continue
+            if cmd_type == "set_model":
+                assert payload.get("provider") == "ollama"
+                assert payload.get("modelId") == "kimi-k2.7-code:cloud"
+                await _write_json_line(
+                    writer,
+                    {
+                        "type": "command_response",
+                        "frame": {"type": "response", "success": True, "id": "m1"},
+                    },
+                )
+                continue
+            assert cmd_type == "prompt"
+            assert payload.get("message") == "hi"
 
-        await _write_json_line(
-            writer,
-            {
-                "type": "command_response",
-                "frame": {"type": "response", "success": True, "id": "p1"},
-            },
-        )
+            # Exercise the demux path: emit events before the matching response.
+            await _write_json_line(
+                writer,
+                {
+                    "type": "event",
+                    "frame": {
+                        "type": "message_update",
+                        "assistantMessageEvent": {"type": "text_delta", "delta": "Hello"},
+                    },
+                },
+            )
+            await _write_json_line(
+                writer,
+                {
+                    "type": "command_response",
+                    "frame": {"type": "response", "success": True, "id": "p1"},
+                },
+            )
 
-        started.set()
+            started.set()
 
-        await _write_json_line(
-            writer,
-            {
-                "type": "event",
-                "frame": {
-                    "type": "message_update",
-                    "assistantMessageEvent": {"type": "text_delta", "delta": "Hello"},
+            await _write_json_line(
+                writer,
+                {
+                    "type": "event",
+                    "frame": {
+                        "type": "tool_execution_start",
+                        "toolName": "Bash",
+                        "arguments": {"command": "echo hi"},
+                    },
                 },
-            },
-        )
-        await _write_json_line(
-            writer,
-            {
-                "type": "event",
-                "frame": {
-                    "type": "tool_execution_start",
-                    "toolName": "Bash",
-                    "arguments": {"command": "echo hi"},
+            )
+            await _write_json_line(
+                writer,
+                {
+                    "type": "event",
+                    "frame": {
+                        "type": "tool_execution_end",
+                        "toolName": "Bash",
+                        "status": "success",
+                        "result": {"stdout": "hi"},
+                    },
                 },
-            },
-        )
-        await _write_json_line(
-            writer,
-            {
-                "type": "event",
-                "frame": {
-                    "type": "tool_execution_end",
-                    "toolName": "Bash",
-                    "status": "success",
-                    "result": {"stdout": "hi"},
-                },
-            },
-        )
-        await _write_json_line(
-            writer,
-            {"type": "event", "frame": {"type": "agent_end", "isTerminal": True}},
-        )
-        await _write_json_line(writer, {"type": "bridge_closed"})
+            )
+            await _write_json_line(
+                writer,
+                {"type": "event", "frame": {"type": "agent_end", "isTerminal": True}},
+            )
+            await _write_json_line(writer, {"type": "bridge_closed"})
+            return
     finally:
         writer.close()
         with contextlib.suppress(Exception):
@@ -149,6 +184,7 @@ async def _fake_bridge():
         with contextlib.suppress(asyncio.CancelledError):
             await task
         import shutil
+
         shutil.rmtree(bridge_dir, ignore_errors=True)
 
 
@@ -160,6 +196,7 @@ async def _collect(iterator: AsyncIterator[ExecutorEvent]) -> list[ExecutorEvent
 async def test_terminal_client_connects_to_fake_bridge() -> None:
     """Sanity-check that the test harness can be reached."""
     from omnigent.omp_native_terminal import OmpNativeTerminalClient
+
     async with _fake_bridge() as bridge_dir:
         client = OmpNativeTerminalClient(bridge_dir)
         await asyncio.wait_for(client.connect(), timeout=5.0)
@@ -168,7 +205,7 @@ async def test_terminal_client_connects_to_fake_bridge() -> None:
 
 @pytest.mark.anyio
 async def test_native_executor_streams_bridge_events() -> None:
-    """The executor connects to the bridge, sends the prompt, and translates events."""
+    """The executor connects to the bridge, sends system/model/prompt, and translates events."""
     async with _fake_bridge() as bridge_dir:
         os.environ[OMP_NATIVE_BRIDGE_DIR_ENV_VAR] = str(bridge_dir)
         executor = OmpNativeExecutor()
@@ -177,8 +214,8 @@ async def test_native_executor_streams_bridge_events() -> None:
             executor.run_turn(
                 messages=[{"role": "user", "content": "hi"}],
                 tools=[],
-                system_prompt="",
-                config=ExecutorConfig(),
+                system_prompt="You are a helpful assistant.",
+                config=ExecutorConfig(model="ollama/kimi-k2.7-code:cloud"),
             )
         )
 

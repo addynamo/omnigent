@@ -9,10 +9,10 @@ bridge's authenticated local socket and forwards user messages as OMP
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any
 
 from omnigent.inner.executor import (
     EnqueuedContent,
@@ -29,6 +29,7 @@ from omnigent.inner.omp_executor import (
     _is_local_prompt_result,
     _is_terminal_agent_end,
     _last_user_text,
+    _split_model,
     _translate_omp_event,
 )
 from omnigent.omp_native_bridge import (
@@ -36,6 +37,8 @@ from omnigent.omp_native_bridge import (
     OMP_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
 )
 from omnigent.omp_native_terminal import OmpNativeTerminalClient
+
+logger = logging.getLogger(__name__)
 
 
 class OmpNativeExecutor(Executor):
@@ -48,6 +51,7 @@ class OmpNativeExecutor(Executor):
     def __init__(self, bridge_dir: Path | None = None) -> None:
         self._bridge_dir = bridge_dir or _bridge_dir_from_env()
         self._request_session_id = _request_session_id_from_env()
+        self._system_prompt_sent = False
 
     def supports_streaming(self) -> bool:
         """The bridge streams events to every attached surface."""
@@ -81,7 +85,7 @@ class OmpNativeExecutor(Executor):
         config: ExecutorConfig | None = None,
     ) -> AsyncIterator[ExecutorEvent]:
         """Forward the latest user message to OMP and stream translated events."""
-        del tools, system_prompt
+        del tools
         user_message = _last_user_text(messages) or ""
         if not user_message:
             yield ExecutorError(message="OMP-native turn had no user text to send")
@@ -93,11 +97,18 @@ class OmpNativeExecutor(Executor):
             await asyncio.wait_for(client.connect(), timeout=10.0)
 
             if config.model:
+                provider, model_id = _split_model(config.model)
+                if not provider or not model_id:
+                    yield ExecutorError(
+                        message=f"OMP model must use provider/model form: {config.model}"
+                    )
+                    return
                 # Best-effort model forwarding via the bridge.  Failures are
                 # surfaced as executor errors so the UI can report them.
                 try:
                     response = await client.send_command(
-                        {"type": "set_model", "model": config.model}, wait=True
+                        {"type": "set_model", "provider": provider, "modelId": model_id},
+                        wait=True,
                     )
                     if isinstance(response, dict) and not response.get("success"):
                         yield ExecutorError(
@@ -107,6 +118,17 @@ class OmpNativeExecutor(Executor):
                 except RuntimeError as exc:
                     yield ExecutorError(message=f"OMP set_model failed: {exc}")
                     return
+
+            if system_prompt and not self._system_prompt_sent:
+                try:
+                    await client.send_command(
+                        {"type": "set_system_prompt", "message": system_prompt}, wait=True
+                    )
+                except RuntimeError as exc:
+                    # OMP may not support this command; do not fail the turn.
+                    logger.warning("OMP set_system_prompt failed: %s", exc)
+                else:
+                    self._system_prompt_sent = True
 
             prompt_response = await client.send_command(
                 {"type": "prompt", "message": user_message}, wait=True
@@ -125,7 +147,8 @@ class OmpNativeExecutor(Executor):
                 yield TurnComplete(response=None)
                 return
 
-            prompt_id = prompt_response.get("id") if isinstance(prompt_response.get("id"), str) else None
+            prompt_id_value = prompt_response.get("id")
+            prompt_id = prompt_id_value if isinstance(prompt_id_value, str) else None
             response_text = ""
             async for wrapper in client.events():
                 wrapper_type = wrapper.get("type")
@@ -146,7 +169,7 @@ class OmpNativeExecutor(Executor):
                     if isinstance(event, TextChunk):
                         response_text += event.text
                     yield event
-                if _is_terminal_agent_end(raw) or _is_local_prompt_result(raw, prompt_id):
+                if _is_local_prompt_result(raw, prompt_id) or _is_terminal_agent_end(raw):
                     yield TurnComplete(response=response_text or None)
                     return
         except RuntimeError as exc:

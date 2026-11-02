@@ -18,7 +18,10 @@ Scenario shape::
           "response": {"type": "response", "command": "prompt", "success": true},
           "events": [
             {"type": "agent_start"},
-            {"type": "message_update", "assistantMessageEvent": {"type": "text_delta", "delta": "hi"}},
+            {
+              "type": "message_update",
+              "assistantMessageEvent": {"type": "text_delta", "delta": "hi"},
+            },
             {"type": "agent_end", "isTerminal": true}
           ]
         }
@@ -38,7 +41,6 @@ from __future__ import annotations
 
 import base64
 import json
-import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -57,10 +59,7 @@ def _log(path: str | None, message: str) -> None:
 
 
 def _matches(frame: dict[str, Any], pattern: dict[str, Any]) -> bool:
-    for key, value in pattern.items():
-        if frame.get(key) != value:
-            return False
-    return True
+    return all(frame.get(key) == value for key, value in pattern.items())
 
 
 def _write_line(line: str, max_frame_bytes: int, chunk_counter: list[int]) -> None:
@@ -90,7 +89,9 @@ def _write_line(line: str, max_frame_bytes: int, chunk_counter: list[int]) -> No
 
 
 def _write_frame(frame: dict[str, Any], max_frame_bytes: int, chunk_counter: list[int]) -> None:
-    _write_line(json.dumps(frame, separators=(",", ":"), default=str), max_frame_bytes, chunk_counter)
+    _write_line(
+        json.dumps(frame, separators=(",", ":"), default=str), max_frame_bytes, chunk_counter
+    )
 
 
 def _default_response(cmd: dict[str, Any]) -> dict[str, Any] | None:
@@ -148,7 +149,9 @@ def _process_event_item(
                 frame = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            _log(log_path, f"wait_received: {json.dumps(frame, separators=(',', ':'), default=str)}")
+            _log(
+                log_path, f"wait_received: {json.dumps(frame, separators=(',', ':'), default=str)}"
+            )
             if _matches(frame, pattern):
                 for ev in then_events:
                     _write_frame(ev, max_frame_bytes, chunk_counter)

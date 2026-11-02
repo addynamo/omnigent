@@ -18,7 +18,7 @@ from omnigent.inner.omp_executor import NativeModelOption
 
 OmpRunner: TypeAlias = Callable[[list[str]], subprocess.CompletedProcess[str]]
 
-_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
 _THINKING_LEVELS = frozenset({"off", "minimal", "low", "medium", "high", "xhigh"})
 
 
@@ -56,7 +56,7 @@ def _validate_identifier(value: str, *, name: str) -> str:
     if not isinstance(value, str) or not _IDENTIFIER_RE.fullmatch(value):
         raise OmpValidationError(
             f"OMP {name} must be a non-empty identifier containing only letters, numbers, "
-            "'.', '_', or '-'."
+            "'.', '_', '-', or ':'."
         )
     return value
 
@@ -116,9 +116,12 @@ def _parse_model_catalog(raw: str) -> list[NativeModelOption]:
         display_name = entry.get("displayName") or entry.get("name") or model_id
         provider_name = entry.get("providerName")
         aliases = entry.get("aliases", [])
-        if not isinstance(display_name, str) or (
-            provider_name is not None and not isinstance(provider_name, str)
-        ) or not isinstance(aliases, list) or not all(isinstance(alias, str) for alias in aliases):
+        if (
+            not isinstance(display_name, str)
+            or (provider_name is not None and not isinstance(provider_name, str))
+            or not isinstance(aliases, list)
+            or not all(isinstance(alias, str) for alias in aliases)
+        ):
             raise OmpConfigParseError(
                 command_class, "returned a catalog with invalid model metadata."
             )

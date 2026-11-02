@@ -206,7 +206,10 @@ def test_subagent_dispatch_text_advertises_task_titles_and_purpose(
     assert "Collect finished worker results with `sys_read_inbox`" in config
     assert "do not use `sys_timer_set` or any delayed self-message" in config_compact
     assert "Collect its structured result with `sys_read_inbox`" in fanout
-    assert "collect the inbox-delivered structured report with `sys_read_inbox`" in cross_review_compact
+    assert (
+        "collect the inbox-delivered structured report with `sys_read_inbox`"
+        in cross_review_compact
+    )
     purpose_guard = next(
         p for p in polly_spec.guardrails.policies if p.name == "headless_subagent_purpose_guard"
     )

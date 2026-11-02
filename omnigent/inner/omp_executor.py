@@ -19,10 +19,10 @@ import json
 import logging
 import os
 import shutil
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, TypeAlias
+from typing import Any, TypeAlias, cast
 
 from omnigent._platform import resolve_cli_binary
 from omnigent.json_types import JsonObject as _JsonObject
@@ -228,11 +228,16 @@ class _OmpRpcSession:
         ready = await self._read_one_frame(timeout=30.0)
         if not isinstance(ready, dict) or ready.get("type") != "ready":
             raise OmpProtocolError(f"Expected OMP ready frame, got: {ready!r}")
-        self._max_frame_bytes = int(ready.get("maxFrameBytes", self._max_frame_bytes))
-        self._max_reassembled_frame_bytes = int(
-            ready.get("maxReassembledFrameBytes", self._max_reassembled_frame_bytes)
+        _max_frame_bytes = ready.get("maxFrameBytes", self._max_frame_bytes)
+        if isinstance(_max_frame_bytes, (int, float, str)):
+            self._max_frame_bytes = int(_max_frame_bytes)
+        _max_reassembled_frame_bytes = ready.get(
+            "maxReassembledFrameBytes", self._max_reassembled_frame_bytes
         )
-        supported = ready.get("supportedProtocolVersions", [])
+        if isinstance(_max_reassembled_frame_bytes, (int, float, str)):
+            self._max_reassembled_frame_bytes = int(_max_reassembled_frame_bytes)
+        _supported = ready.get("supportedProtocolVersions", [])
+        supported = _supported if isinstance(_supported, list) else []
         if 2 in supported:
             response = await self.send_command(
                 {"type": "negotiate_protocol", "protocolVersion": 2}
@@ -351,9 +356,10 @@ class _OmpRpcSession:
                 f"rpc_chunk sequence {self._active_chunk_id} interrupted by {ftype!r} frame"
             )
         if ftype == "rpc_chunk":
-            frame = await self._reassemble_chunk(frame)
-            if frame is None:
+            reassembled = await self._reassemble_chunk(frame)
+            if reassembled is None:
                 return
+            frame = reassembled
             ftype = frame.get("type")
 
         # Host-facing callbacks (tool / extension UI / URI) are handled inline
@@ -386,7 +392,7 @@ class _OmpRpcSession:
         else:
             await self._events.put(frame)
 
-    def _track_callback(self, coroutine: Awaitable[None]) -> None:
+    def _track_callback(self, coroutine: Coroutine[Any, Any, None]) -> None:
         """Keep an OMP callback alive until it produces its RPC response."""
         task = asyncio.create_task(coroutine)
         self._callback_tasks.add(task)
@@ -613,6 +619,7 @@ class OmpExecutor(Executor):
         self._tool_executor: ToolExecutor | None = None
         self._elicitation_handler: ElicitationHandler | None = None
         self._last_session_file: str | None = None
+        self._system_prompt_sent = False
 
     @property
     def command(self) -> list[str]:
@@ -642,14 +649,14 @@ class OmpExecutor(Executor):
         self,
         messages: list[Message],
         tools: list[ToolSpec],
-        system_prompt: str,  # noqa: ARG002
+        system_prompt: str,
         config: ExecutorConfig | None = None,
     ) -> AsyncIterator[ExecutorEvent]:
         """Run one OMP agent turn.
 
-        Sends the last user message to OMP, registers Omnigent tools as
-        host-owned RPC tools, and yields translated events until the turn
-        completes.
+        Sends the system prompt once per session, registers Omnigent tools as
+        host-owned RPC tools, forwards the last user message to OMP, and yields
+        translated events until the turn completes.
         """
         try:
             session = await self._ensure_session()
@@ -702,6 +709,16 @@ class OmpExecutor(Executor):
                 yield ExecutorError(message=f"Failed to set OMP model: {exc}")
                 return
 
+        # Deliver the composed system prompt once per session.  OMP may not
+        # expose a dedicated RPC command, so failures are logged but not fatal.
+        if system_prompt and not self._system_prompt_sent:
+            try:
+                await session.send_command({"type": "set_system_prompt", "message": system_prompt})
+            except OmpProtocolError as exc:
+                logger.warning("OMP set_system_prompt failed: %s", exc)
+            else:
+                self._system_prompt_sent = True
+
         # Send the user prompt and wait for the ack before streaming events.
         try:
             response = await session.send_command({"type": "prompt", "message": user_message})
@@ -735,8 +752,9 @@ class OmpExecutor(Executor):
                 yield TurnComplete(response=response_text or None)
                 return
 
-    async def close_session(self, _session_key: str) -> None:
+    async def close_session(self, session_key: str) -> None:
         """Close the persistent OMP subprocess for *session_key*."""
+        _ = session_key
         if self._session is not None:
             await self._session.close()
             self._session = None
@@ -812,7 +830,7 @@ class OmpExecutor(Executor):
         response = await session.send_command({"type": "get_state"})
         if not response.get("success"):
             raise OmpProtocolError(response.get("error", "OMP get_state failed"))
-        data = response.get("data", {})
+        data = cast(_JsonObject, response.get("data", {}))
         session_file = data.get("sessionFile")
         if isinstance(session_file, str):
             self._last_session_file = session_file
@@ -912,9 +930,7 @@ def _translate_omp_event(event: _JsonObject) -> list[ExecutorEvent]:
         # A response without a matching pending request (e.g. late prompt
         # scheduling error) is surfaced as an error event.
         if not event.get("success"):
-            result.append(
-                ExecutorError(message=f"OMP command failed: {event.get('error', '')}")
-            )
+            result.append(ExecutorError(message=f"OMP command failed: {event.get('error', '')}"))
     elif ftype not in {"agent_start", "agent_end", "turn_start", "turn_end"}:
         # Unknown frame type: log but do not hang. Tests assert this.
         logger.debug("Unrecognized OMP event type %r", ftype)

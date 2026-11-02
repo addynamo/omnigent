@@ -51,7 +51,8 @@ def _validate_session_file(session_file: Path) -> Path:
     if not path.is_file() or not os.access(path, os.R_OK):
         raise OmpNativeResumeError(
             f"Cannot resume OMP: stored sessionFile {path} is missing or unreadable. "
-            "Restore that file or start a new OMP-native session; Omnigent will not rebuild context."
+            "Restore that file or start a new OMP-native session; "
+            "Omnigent will not rebuild context."
         )
     return path
 
@@ -165,7 +166,9 @@ class OmpRpcBridge:
         with contextlib.suppress(FileNotFoundError):
             self.socket_path.unlink()
         _write_owner_only(self.token_path, secrets.token_urlsafe(32))
-        self._server = await asyncio.start_unix_server(self._accept_client, path=str(self.socket_path))
+        self._server = await asyncio.start_unix_server(
+            self._accept_client, path=str(self.socket_path)
+        )
         os.chmod(self.socket_path, 0o600)
         self._process = await self._process_factory(
             *self._command,
@@ -175,7 +178,9 @@ class OmpRpcBridge:
             cwd=self._cwd,
             env=self._env,
         )
-        self._reader_task = asyncio.create_task(self._read_omp(), name=f"omp-native-{self.session_id}")
+        self._reader_task = asyncio.create_task(
+            self._read_omp(), name=f"omp-native-{self.session_id}"
+        )
         await asyncio.wait_for(self._ready.wait(), timeout=30.0)
         # Capture durable OMP state before anyone can later choose a resume path.
         await self.send_command({"type": "get_state"}, timeout=30.0)
@@ -307,7 +312,9 @@ class OmpRpcBridge:
                 try:
                     frame = json.loads(line)
                 except ValueError:
-                    await self._broadcast({"type": "bridge_error", "error": "OMP emitted invalid JSON"})
+                    await self._broadcast(
+                        {"type": "bridge_error", "error": "OMP emitted invalid JSON"}
+                    )
                     continue
                 if not isinstance(frame, dict):
                     continue
@@ -324,7 +331,9 @@ class OmpRpcBridge:
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - publish a bridge failure to all attached surfaces
-            await self._broadcast({"type": "bridge_error", "error": str(exc) or "OMP bridge failed"})
+            await self._broadcast(
+                {"type": "bridge_error", "error": str(exc) or "OMP bridge failed"}
+            )
         finally:
             if not self._closed:
                 await self._broadcast({"type": "bridge_closed"})
@@ -337,11 +346,15 @@ class OmpRpcBridge:
         self._session_file = Path(value)
         _write_owner_only(
             self.state_path,
-            json.dumps({"sessionFile": value, "sessionId": self.session_id}, separators=(",", ":")),
+            json.dumps(
+                {"sessionFile": value, "sessionId": self.session_id}, separators=(",", ":")
+            ),
         )
         self._session_file_ready.set()
 
-    async def _accept_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    async def _accept_client(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
         try:
             first = await asyncio.wait_for(_read_json_line(reader), timeout=10.0)
             token = first.get("token") if first.get("type") == "authenticate" else None
@@ -358,17 +371,23 @@ class OmpRpcBridge:
                 if kind == "command":
                     payload = message.get("payload")
                     if not isinstance(payload, dict):
-                        await _write_json_line(writer, {"type": "error", "error": "command payload must be an object"})
+                        await _write_json_line(
+                            writer, {"type": "error", "error": "command payload must be an object"}
+                        )
                         continue
                     if message.get("wait"):
                         response = await self.send_command(payload)
-                        await _write_json_line(writer, {"type": "command_response", "frame": response})
+                        await _write_json_line(
+                            writer, {"type": "command_response", "frame": response}
+                        )
                     else:
                         await self.send_frame(payload)
                 elif kind == "close":
                     return
                 else:
-                    await _write_json_line(writer, {"type": "error", "error": "unknown bridge message"})
+                    await _write_json_line(
+                        writer, {"type": "error", "error": "unknown bridge message"}
+                    )
         except (asyncio.IncompleteReadError, ConnectionError, OSError):
             return
         finally:

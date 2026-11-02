@@ -333,6 +333,13 @@ describe("getConversationIconKind", () => {
       ),
     ).toBe("antigravity");
     expect(
+      getConversationIconKind(
+        conversation("conv_omp", null, new Date(2026, 4, 14, 9), {
+          labels: { "omnigent.wrapper": "omp-native-ui" },
+        }),
+      ),
+    ).toBe("omp");
+    expect(
       getConversationIconKind({
         ...conversation("conv_nessie", null, new Date(2026, 4, 14, 9)),
         agent_name: "nessie",

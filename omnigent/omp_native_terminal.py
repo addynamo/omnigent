@@ -15,7 +15,7 @@ import sys
 from pathlib import Path
 from typing import Any, TextIO
 
-from omnigent.omp_native_bridge import OmpRpcBridge, _read_json_line, _write_json_line
+from omnigent.omp_native_bridge import _read_json_line, _write_json_line
 
 
 class OmpNativeTerminalClient:
@@ -25,6 +25,9 @@ class OmpNativeTerminalClient:
         self.bridge_dir = bridge_dir
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
+        self._reader_task: asyncio.Task[None] | None = None
+        self._event_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        self._pending_responses: asyncio.Queue[asyncio.Future[dict[str, Any]]] = asyncio.Queue()
 
     async def connect(self) -> None:
         """Connect and authenticate using the bridge's owner-only bearer token."""
@@ -36,6 +39,9 @@ class OmpNativeTerminalClient:
         reply = await _read_json_line(self._reader)
         if reply.get("type") != "authenticated":
             raise RuntimeError("OMP native bridge authentication failed")
+        self._reader_task = asyncio.create_task(
+            self._read_loop(), name="omp-native-terminal-reader"
+        )
 
     async def send_command(
         self, payload: dict[str, Any], *, wait: bool = False
@@ -43,14 +49,20 @@ class OmpNativeTerminalClient:
         """Send a command *to the bridge*, never directly to OMP stdio.
 
         When *wait* is True, blocks until the bridge returns the matching OMP
-        command response and returns it.
+        command response and returns the unwrapped OMP frame.
         """
         if self._writer is None:
             raise RuntimeError("OMP native terminal client is not connected")
         await _write_json_line(self._writer, {"type": "command", "payload": payload, "wait": wait})
         if not wait:
             return None
-        response = await _read_json_line(self._reader)
+        future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+        await self._pending_responses.put(future)
+        try:
+            response = await future
+        except asyncio.CancelledError:
+            self._pending_responses = asyncio.Queue()
+            raise
         if response.get("type") == "error":
             raise RuntimeError(response.get("error", "OMP bridge command failed"))
         if response.get("type") != "command_response":
@@ -62,10 +74,15 @@ class OmpNativeTerminalClient:
         if self._reader is None:
             raise RuntimeError("OMP native terminal client is not connected")
         while True:
-            yield await _read_json_line(self._reader)
+            yield await self._event_queue.get()
 
     async def close(self) -> None:
         """Disconnect without touching the bridge-owned OMP process."""
+        if self._reader_task is not None:
+            self._reader_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._reader_task
+            self._reader_task = None
         if self._writer is not None:
             with contextlib.suppress(Exception):
                 await _write_json_line(self._writer, {"type": "close"})
@@ -74,6 +91,34 @@ class OmpNativeTerminalClient:
                 await self._writer.wait_closed()
         self._writer = None
         self._reader = None
+
+    async def _read_loop(self) -> None:
+        """Demultiplex bridge messages into command responses and events."""
+        reader = self._reader
+        if reader is None:
+            return
+        try:
+            while True:
+                message = await _read_json_line(reader)
+                msg_type = message.get("type")
+                if msg_type == "command_response" or msg_type == "error":
+                    try:
+                        pending = self._pending_responses.get_nowait()
+                    except asyncio.QueueEmpty:
+                        # No waiter for this response; treat errors as events and
+                        # drop orphaned command_response frames silently.
+                        if msg_type == "error":
+                            await self._event_queue.put(message)
+                        continue
+                    if not pending.done():
+                        pending.set_result(message)
+                else:
+                    await self._event_queue.put(message)
+        except asyncio.CancelledError:
+            raise
+        except (ConnectionError, OSError, ValueError, asyncio.IncompleteReadError):
+            # Stop the reader; consumers will see the queue drain and bridge_closed.
+            return
 
 
 async def _forward_stdin(client: OmpNativeTerminalClient) -> None:
@@ -124,9 +169,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--bridge-dir", required=True)
     parser.add_argument("--prompt", default=None)
     args = parser.parse_args(argv)
-    asyncio.run(
-        run_omp_native_terminal(bridge_dir=Path(args.bridge_dir), prompt=args.prompt)
-    )
+    asyncio.run(run_omp_native_terminal(bridge_dir=Path(args.bridge_dir), prompt=args.prompt))
 
 
 if __name__ == "__main__":

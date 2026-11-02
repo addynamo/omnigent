@@ -90,9 +90,7 @@ def test_debby_omp_head_uses_omp_harness() -> None:
     spec = parse(_DEBBY_DIR)
     by_name = {sub.name: sub for sub in spec.sub_agents}
 
-    assert "omp" in by_name, (
-        f"Debby should declare an 'omp' sub-agent; got {sorted(by_name)}."
-    )
+    assert "omp" in by_name, f"Debby should declare an 'omp' sub-agent; got {sorted(by_name)}."
     assert by_name["omp"].executor.harness_kind == "omp", (
         "Debby's OMP head should run on the 'omp' harness."
     )

@@ -47,10 +47,10 @@ class _FakeOmpClient:
         del request_id, wait
         self.commands.append(command)
         if command.get("type") == "get_available_models":
-            return {"frame": {"success": True, "data": {"models": self.models}}}
+            return {"success": True, "data": {"models": self.models}}
         if self.command_results:
-            return {"frame": self.command_results.pop(0)}
-        return {"frame": {"success": True}}
+            return self.command_results.pop(0)
+        return {"success": True}
 
     async def close(self) -> None:
         self.closed = True
@@ -91,9 +91,7 @@ async def test_omp_native_model_options_query_bridge(
 
     _patch_omp_auto_create(monkeypatch)
     conv_id = "conv_omp_model_options"
-    expected = [
-        {"id": "ollama/kimi-k2.7-code:cloud", "displayName": "Kimi K2.7 Code Cloud"}
-    ]
+    expected = [{"id": "ollama/kimi-k2.7-code:cloud", "displayName": "Kimi K2.7 Code Cloud"}]
     created_clients: list[_FakeOmpClient] = []
 
     def _fake_client_class(bridge_dir: Path) -> _FakeOmpClient:
@@ -247,7 +245,7 @@ async def test_omp_native_model_change_forwards_to_bridge_and_persists(
     assert resp.status_code == 204, resp.text
     assert len(created_clients) == 1
     assert created_clients[0].commands == [
-        {"type": "set_model", "model": "ollama/kimi-k2.7-code:cloud"}
+        {"type": "set_model", "provider": "ollama", "modelId": "kimi-k2.7-code:cloud"}
     ]
     assert persisted == [(None, "ollama", "kimi-k2.7-code:cloud")]
     assert server_client.patches == [{"model_override": "ollama/kimi-k2.7-code:cloud"}]

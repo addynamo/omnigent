@@ -47,6 +47,20 @@ def _model_roles() -> str:
     )
 
 
+def test_persist_model_accepts_tagged_ollama_identifiers() -> None:
+    """Ollama-style tagged model ids like ``kimi-k2.7-code:cloud`` are valid."""
+    get_argv = ["omp", "config", "get", "modelRoles", "--json"]
+    set_argv = ["omp", "config", "set", "modelRoles"]
+    runner = FakeOmpRunner([_result(get_argv, stdout=_model_roles()), _result(set_argv)])
+
+    OmpProfileConfig(runner=runner).persist_model("ollama", "kimi-k2.7-code:cloud")
+
+    assert json.loads(runner.calls[1][-1]) == {
+        "default": {"provider": "ollama", "model": "kimi-k2.7-code:cloud"},
+        "background": {"provider": "openai", "model": "gpt-5.2"},
+    }
+
+
 def test_persist_model_replaces_only_default_role() -> None:
     """Replacing the default model must retain every unrelated role object."""
     get_argv = ["omp", "config", "get", "modelRoles", "--json"]
@@ -214,9 +228,7 @@ def test_public_helpers_use_the_injected_runner() -> None:
         ("persist_thinking_level", ["omp", "config", "set", "defaultThinkingLevel", "high"]),
     ],
 )
-def test_nonzero_omp_commands_raise_typed_errors(
-    method: str, argv: list[str]
-) -> None:
+def test_nonzero_omp_commands_raise_typed_errors(method: str, argv: list[str]) -> None:
     """Every OMP command class surfaces a non-zero exit as a typed failure."""
     runner = FakeOmpRunner([_result(argv, stderr="OMP failed", returncode=1)])
     config = OmpProfileConfig(runner=runner)

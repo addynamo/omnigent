@@ -2292,7 +2292,6 @@ async def _auto_create_omp_terminal(
     publish_event: Callable[[str, _JsonObject], None],
     *,
     server_client: httpx.AsyncClient | None,
-    ensure_comment_relay: _EnsureCommentRelay | None = None,
     agent_spec: AgentSpec | ResolvedSpec | None = None,
 ) -> SessionResourceView:
     """
@@ -7278,7 +7277,6 @@ async def _launch_omp(ctx: NativeLaunchContext) -> SessionResourceView:
         ctx.publish_event,
         server_client=ctx.server_client,
         agent_spec=ctx.agent_spec,
-        ensure_comment_relay=ctx.ensure_comment_relay,
     )
 
 

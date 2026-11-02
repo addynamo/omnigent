@@ -4270,11 +4270,10 @@ def create_runner_app(
         try:
             await asyncio.wait_for(client.connect(), timeout=10.0)
             response = await client.send_command(
-                {"type": "set_model", "model": selected}, wait=True
+                {"type": "set_model", "provider": provider, "modelId": model_id}, wait=True
             )
-            frame = response.get("frame") if isinstance(response, dict) else None
-            if not isinstance(frame, dict) or not frame.get("success"):
-                error = frame.get("error") if isinstance(frame, dict) else "rejected"
+            if not isinstance(response, dict) or not response.get("success"):
+                error = response.get("error") if isinstance(response, dict) else "rejected"
                 return JSONResponse(
                     status_code=503,
                     content={
@@ -4343,9 +4342,8 @@ def create_runner_app(
             response = await client.send_command(
                 {"type": "set_thinking_level", "level": selected}, wait=True
             )
-            frame = response.get("frame") if isinstance(response, dict) else None
-            if not isinstance(frame, dict) or not frame.get("success"):
-                error = frame.get("error") if isinstance(frame, dict) else "rejected"
+            if not isinstance(response, dict) or not response.get("success"):
+                error = response.get("error") if isinstance(response, dict) else "rejected"
                 return JSONResponse(
                     status_code=503,
                     content={
@@ -4390,9 +4388,7 @@ def create_runner_app(
                 },
             )
 
-        await _omp_native_patch_session_field(
-            conv_id, field="reasoning_effort", value=selected
-        )
+        await _omp_native_patch_session_field(conv_id, field="reasoning_effort", value=selected)
         return Response(status_code=204)
 
     async def _omp_native_session_snapshot(conv_id: str) -> dict[str, Any]:
@@ -8771,12 +8767,9 @@ def create_runner_app(
         client = OmpNativeTerminalClient(bridge_dir)
         try:
             await asyncio.wait_for(client.connect(), timeout=10.0)
-            response = await client.send_command(
-                {"type": "get_available_models"}, wait=True
-            )
-            frame = response.get("frame") if isinstance(response, dict) else None
-            if not isinstance(frame, dict) or not frame.get("success"):
-                error = frame.get("error") if isinstance(frame, dict) else "not ready"
+            response = await client.send_command({"type": "get_available_models"}, wait=True)
+            if not isinstance(response, dict) or not response.get("success"):
+                error = response.get("error") if isinstance(response, dict) else "not ready"
                 return JSONResponse(
                     status_code=503,
                     content={
@@ -8784,7 +8777,7 @@ def create_runner_app(
                         "detail": f"OMP model catalog not ready: {error}",
                     },
                 )
-            data = frame.get("data", {})
+            data = response.get("data", {})
             models = data.get("models") if isinstance(data, dict) else []
             if not isinstance(models, list):
                 models = []
@@ -8799,9 +8792,7 @@ def create_runner_app(
                 options.append(
                     {
                         "id": f"{provider}/{model_id}",
-                        "displayName": entry.get("displayName")
-                        or entry.get("name")
-                        or model_id,
+                        "displayName": entry.get("displayName") or entry.get("name") or model_id,
                         **(
                             {"providerName": entry.get("providerName")}
                             if entry.get("providerName")
@@ -8818,9 +8809,7 @@ def create_runner_app(
                 status_code=503,
                 content={
                     "error": "omp_native_model_options_failed",
-                    "detail": _client_safe_error_detail(
-                        exc, context="omp-native model options"
-                    ),
+                    "detail": _client_safe_error_detail(exc, context="omp-native model options"),
                 },
             )
         finally:

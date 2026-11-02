@@ -16,7 +16,9 @@ from omnigent.omp_native_bridge import (
 )
 
 
-def test_bridge_dir_and_spawn_env_are_session_scoped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_bridge_dir_and_spawn_env_are_session_scoped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """The runner and bridge derive the same isolated location for one conversation."""
     import omnigent.omp_native_bridge as bridge_module
 
@@ -51,5 +53,5 @@ def test_bridge_rejects_missing_resume_file_before_launch(tmp_path: Path) -> Non
     """A missing durable OMP session gives an actionable error instead of replaying chat."""
     missing = tmp_path / "missing.jsonl"
 
-    with pytest.raises(OmpNativeResumeError, match="sessionFile.*missing|missing.*sessionFile"):
+    with pytest.raises(OmpNativeResumeError, match=r"sessionFile.*missing|missing.*sessionFile"):
         OmpRpcBridge(session_id="conv_omp", session_file=missing)
