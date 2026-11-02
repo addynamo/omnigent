@@ -50,6 +50,7 @@ from omnigent.cli_native import register_native_commands as _register_native_com
 from omnigent.cli_sandbox import lakebox as _lakebox_alias_group
 from omnigent.cli_sandbox import sandbox as _sandbox_group
 from omnigent.config import (
+    POLLY_REVIEW_MODEL_CONFIG_KEY,
     _merge_effective_config,
     global_config_path,
     load_global_config,
@@ -603,6 +604,9 @@ _GLOBAL_CONFIG_KEYS: frozenset[str] = frozenset(
         # OpenCode-specific default model (``provider/model``) the native
         # ``omni opencode`` TUI launches on; set via `omni setup` → OpenCode.
         "opencode_model",
+        # Model polly's ``omp`` reviews run on when a review dispatch names
+        # none (``provider/model``), e.g. a different family from the implementer.
+        POLLY_REVIEW_MODEL_CONFIG_KEY,
         "server",
         _AUTO_OPEN_CONVERSATION_CONFIG_KEY,
     }
@@ -9373,6 +9377,13 @@ def _parse_config_settings(
             value = str(Path(value).resolve())
         if key in _BOOLEAN_CONFIG_KEYS:
             parsed[key] = _parse_config_bool(key, value)
+        elif key == POLLY_REVIEW_MODEL_CONFIG_KEY:
+            from omnigent.model_override import validate_model_override
+
+            try:
+                parsed[key] = validate_model_override(value)
+            except ValueError as exc:
+                raise click.ClickException(f"Invalid {key}: {exc}") from exc
         else:
             parsed[key] = value
     return parsed

@@ -167,9 +167,14 @@ prompt: |
   ready for the human to merge — you do NOT merge it.
 
   Cross-review needs a reviewer from a DIFFERENT harness/model than the
-  implementer. If only `omp` is available and no explicit different-harness
-  override is requested, you CANNOT run independent cross-vendor review. Say so
-  explicitly and pull in the human at the plan gate to decide how to proceed.
+  implementer. The operator may set a review model (`polly_review_model` in
+  Omnigent config): a `review` dispatch to `omp` without `args.model` then runs
+  on that model, and the child session's `model` shows which. An `omp` review on
+  a different model family than the implementer counts as independent review.
+  If only `omp` is available, no review model is configured, and no explicit
+  different-harness override is requested, you CANNOT run independent
+  cross-vendor review. Say so explicitly and pull in the human at the plan gate
+  to decide how to proceed.
 
   Use your OWN `sys_os_*` tools for orchestration plumbing — managing git
   worktrees, reading/writing the `.polly/registry.json` task list, collecting

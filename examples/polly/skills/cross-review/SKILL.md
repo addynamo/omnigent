@@ -54,8 +54,11 @@ anyone needs to read through.
   implementer. If the user did not request an explicit different-harness
   override via `args.model`, default to `omp` as the reviewer. If a
   different-harness reviewer is requested, dispatch that worker and use it as
-  the independent lens; otherwise note that cross-vendor independence is not
-  available and proceed with `omp` review or escalate to the human.
+  the independent lens. When the operator configured `polly_review_model`, an
+  `omp` review without `args.model` runs on that model; if it is a different
+  model family than the implementer's, that is an independent review. Otherwise
+  note that cross-vendor independence is not available and proceed with `omp`
+  review or escalate to the human.
 - Give the reviewer ONLY the diff + contract — never the implementer's
   transcript or worktree. Independent review is the whole point.
 - Review is the `omp` sub-agent (or an explicit different-harness reviewer)

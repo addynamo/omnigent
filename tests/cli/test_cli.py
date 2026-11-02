@@ -4641,6 +4641,52 @@ def test_config_set_rejects_invalid_auto_open_conversation(
     assert "must be a boolean" in result.output
 
 
+def test_config_set_global_polly_review_model(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    ``polly_review_model`` is a supported key and persists the model id verbatim.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Temporary directory standing in for ~/.omnigent.
+    """
+    config_path = tmp_path / "config.yaml"
+    monkeypatch.setattr("omnigent.cli._GLOBAL_CONFIG_PATH", config_path)
+
+    result = CliRunner().invoke(
+        cli,
+        ["config", "set", "--global", "polly_review_model=ollama/minimax-m3:cloud"],
+    )
+
+    assert result.exit_code == 0, result.output
+    cfg = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert cfg["polly_review_model"] == "ollama/minimax-m3:cloud"
+
+
+def test_config_set_rejects_invalid_polly_review_model(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A ``polly_review_model`` that is not a valid model id is rejected at set time.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Temporary directory standing in for ~/.omnigent.
+    """
+    config_path = tmp_path / "config.yaml"
+    monkeypatch.setattr("omnigent.cli._GLOBAL_CONFIG_PATH", config_path)
+
+    result = CliRunner().invoke(
+        cli,
+        ["config", "set", "--global", "polly_review_model=--evil"],
+    )
+
+    assert result.exit_code != 0
+    assert "polly_review_model" in result.output
+    assert not config_path.exists()
+
+
 def test_config_list_shows_saved_values(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
