@@ -708,6 +708,54 @@ async def test_bad_v2_chunks_fail_session_and_next_call_recovers(
     await executor.close()
 
 
+async def test_interrupted_v2_chunks_fail_session_without_dispatching_event(
+    tmp_path: Path,
+) -> None:
+    scenario_path = _write_scenario(
+        tmp_path,
+        {
+            "ready": _ready(),
+            "interactions": [
+                {
+                    "match": {"type": "get_state"},
+                    "events": [
+                        {
+                            "raw": json.dumps(
+                                {
+                                    "type": "rpc_chunk",
+                                    "chunkId": "partial",
+                                    "index": 0,
+                                    "count": 2,
+                                    "byteLength": 2,
+                                    "data": "YQ==",
+                                }
+                            )
+                        },
+                        {"type": "agent_start"},
+                    ],
+                }
+            ],
+        },
+    )
+    executor = OmpExecutor(
+        command=[sys.executable, str(FAKE_OMP), str(scenario_path)],
+        cwd=tmp_path,
+        env={**os.environ, "PYTHONUNBUFFERED": "1"},
+    )
+
+    session = await executor._ensure_session()
+    with pytest.raises(OmpProtocolError, match="interrupted"):
+        await session.send_command({"type": "get_state"}, timeout=0.5)
+    assert await session.read_event(timeout=0.1) is None
+    assert session.failed
+
+    _write_scenario(tmp_path, {"ready": _ready()})
+    state = await asyncio.wait_for(executor.get_state(), timeout=0.5)
+    assert state["sessionFile"] == "/tmp/fake.omp"
+    assert executor._session is not session
+    await executor.close()
+
+
 async def test_set_model_and_set_thinking_level(tmp_path: Path) -> None:
     executor = _executor(
         tmp_path,

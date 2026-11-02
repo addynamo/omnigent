@@ -346,6 +346,10 @@ class _OmpRpcSession:
 
     async def _handle_frame(self, frame: _JsonObject) -> None:
         ftype = frame.get("type")
+        if self._active_chunk_id is not None and ftype != "rpc_chunk":
+            raise OmpProtocolError(
+                f"rpc_chunk sequence {self._active_chunk_id} interrupted by {ftype!r} frame"
+            )
         if ftype == "rpc_chunk":
             frame = await self._reassemble_chunk(frame)
             if frame is None:

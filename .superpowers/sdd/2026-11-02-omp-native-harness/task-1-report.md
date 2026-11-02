@@ -34,3 +34,12 @@ Commit: f5f17f8f feat: add headless OMP RPC harness
 ### Verification
 - `uv run pytest tests/inner/test_omp_executor.py tests/inner/test_omp_harness.py tests/test_harness_plugins.py -q --tb=short` — `49 passed in 27.45s`.
 - `uv run ruff check omnigent/inner/omp_executor.py omnigent/inner/omp_harness.py omnigent/runtime/workflow.py omnigent/harness_plugins.py tests/inner/test_omp_executor.py tests/inner/test_omp_harness.py tests/test_harness_plugins.py` — `All checks passed!`.
+
+## Fix round 2
+
+- Rejected any non-`rpc_chunk` frame that arrives while a v2 chunk sequence remains incomplete, failing the session before the frame is dispatched.
+- Added a regression test that verifies the interrupted event is not delivered, the caller receives an `OmpProtocolError`, and the next call creates a healthy session.
+
+### Verification
+- `uv run ruff check omnigent/inner/omp_executor.py tests/inner/test_omp_executor.py` — `All checks passed!`
+- `uv run pytest tests/inner/test_omp_executor.py tests/inner/test_omp_harness.py tests/test_harness_plugins.py -q --tb=short` — `50 passed in 14.21s`
