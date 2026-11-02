@@ -2056,6 +2056,7 @@ def create_runner_app(
     _session_comment_relays: dict[str, _CommentRelayBinding] = {}
     _codex_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _pi_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
+    _omp_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _opencode_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _cursor_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _kiro_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
@@ -2943,6 +2944,7 @@ def create_runner_app(
                 "claude": _claude_terminal_ensure_locks,
                 "codex": _codex_terminal_ensure_locks,
                 "pi": _pi_terminal_ensure_locks,
+                "omp": _omp_terminal_ensure_locks,
                 "cursor": _cursor_terminal_ensure_locks,
                 "kiro": _kiro_terminal_ensure_locks,
                 "antigravity": _antigravity_terminal_ensure_locks,
@@ -3132,8 +3134,8 @@ def create_runner_app(
 
                 _launch_pre = _antigravity_pre_launch
 
-            elif harness_name == "pi-native":
-                # pi resolves its spec unwrapped — a resolution error surfaces as
+            elif harness_name in ("pi-native", "omp-native"):
+                # pi/omp resolve their spec unwrapped — a resolution error surfaces as
                 # a terminal-start error (the resolver does not swallow it).
                 _launch_resolve_spec = lambda: _resolve_session_agent_spec(session_id)  # noqa: E731
             elif harness_name in ("cursor-native", "opencode-native", "kimi-native"):
@@ -3440,6 +3442,7 @@ def create_runner_app(
         _codex_terminal_ensure_locks.pop(session_id, None)
         _claude_terminal_ensure_locks.pop(session_id, None)
         _pi_terminal_ensure_locks.pop(session_id, None)
+        _omp_terminal_ensure_locks.pop(session_id, None)
         _cursor_terminal_ensure_locks.pop(session_id, None)
         _kiro_terminal_ensure_locks.pop(session_id, None)
         _antigravity_terminal_ensure_locks.pop(session_id, None)
@@ -4005,6 +4008,7 @@ def create_runner_app(
         if status != "failed" and harness in {
             "claude-native",
             "pi-native",
+            "omp-native",
             "cursor-native",
             "kiro-native",
             "goose-native",
@@ -7288,6 +7292,7 @@ def create_runner_app(
                 "claude": _claude_terminal_ensure_locks,
                 "codex": _codex_terminal_ensure_locks,
                 "pi": _pi_terminal_ensure_locks,
+                "omp": _omp_terminal_ensure_locks,
                 "cursor": _cursor_terminal_ensure_locks,
                 "kiro": _kiro_terminal_ensure_locks,
                 "antigravity": _antigravity_terminal_ensure_locks,
@@ -7383,8 +7388,8 @@ def create_runner_app(
                     "and could not be closed."
                 )
 
-            elif terminal_name in ("pi", "opencode"):
-                # pi/opencode resolve the spec unwrapped — a resolution error
+            elif terminal_name in ("pi", "opencode", "omp"):
+                # pi/opencode/omp resolve the spec unwrapped — a resolution error
                 # surfaces as a terminal-start error (the resolver does not
                 # swallow it).
                 async def _spec_ensure_build(
@@ -8802,6 +8807,7 @@ def create_runner_app(
         _codex_terminal_ensure_locks.pop(session_id, None)
         _claude_terminal_ensure_locks.pop(session_id, None)
         _pi_terminal_ensure_locks.pop(session_id, None)
+        _omp_terminal_ensure_locks.pop(session_id, None)
         _cursor_terminal_ensure_locks.pop(session_id, None)
         _kiro_terminal_ensure_locks.pop(session_id, None)
         _antigravity_terminal_ensure_locks.pop(session_id, None)
@@ -8829,6 +8835,7 @@ def create_runner_app(
         _codex_terminal_ensure_locks.pop(session_id, None)
         _claude_terminal_ensure_locks.pop(session_id, None)
         _pi_terminal_ensure_locks.pop(session_id, None)
+        _omp_terminal_ensure_locks.pop(session_id, None)
         _cursor_terminal_ensure_locks.pop(session_id, None)
         _kiro_terminal_ensure_locks.pop(session_id, None)
         _antigravity_terminal_ensure_locks.pop(session_id, None)
