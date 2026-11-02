@@ -847,73 +847,78 @@ class OmpExecutor(Executor):
         return self._session
 
     def _translate_event(self, event: _JsonObject) -> list[ExecutorEvent]:
-        ftype = event.get("type")
-        result: list[ExecutorEvent] = []
-        if ftype == "message_update":
-            ame = event.get("assistantMessageEvent", {}) if isinstance(event, dict) else {}
-            if not isinstance(ame, dict):
-                return result
-            delta_type = ame.get("type")
-            delta = ame.get("delta")
-            if delta_type == "text_delta" and isinstance(delta, str) and delta:
-                result.append(TextChunk(text=delta))
-            elif delta_type == "thinking_delta" and isinstance(delta, str):
-                result.append(ReasoningChunk(delta=delta, event_type="reasoning_text"))
-            elif delta_type == "toolcall_delta":
-                # Delta-level tool calls are informational only; lifecycle
-                # events produce the actionable ToolCallRequest/Complete.
-                pass
-        elif ftype == "tool_execution_start":
-            name = str(event.get("toolName", ""))
-            args = event.get("arguments") if isinstance(event.get("arguments"), dict) else {}
-            if name:
-                result.append(ToolCallRequest(name=name, args=args))
-        elif ftype == "tool_execution_end":
-            status = event.get("status")
-            result_data = event.get("result") if isinstance(event.get("result"), dict) else {}
-            if status == "error":
-                result.append(
-                    ToolCallComplete(
-                        name=str(event.get("toolName", "")),
-                        status=ToolCallStatus.ERROR,
-                        result=result_data,
-                    )
-                )
-            elif status == "cancelled":
-                result.append(
-                    ToolCallComplete(
-                        name=str(event.get("toolName", "")),
-                        status=ToolCallStatus.CANCELLED,
-                        result=result_data,
-                    )
-                )
-            else:
-                result.append(
-                    ToolCallComplete(
-                        name=str(event.get("toolName", "")),
-                        status=ToolCallStatus.SUCCESS,
-                        result=result_data,
-                    )
-                )
-        elif ftype == "model_changed":
-            # Native bridge may observe and publish metadata.
+        return _translate_omp_event(event)
+
+
+def _translate_omp_event(event: _JsonObject) -> list[ExecutorEvent]:
+    """Translate a raw OMP JSONL frame into Omnigent executor events."""
+    ftype = event.get("type")
+    result: list[ExecutorEvent] = []
+    if ftype == "message_update":
+        ame = event.get("assistantMessageEvent", {}) if isinstance(event, dict) else {}
+        if not isinstance(ame, dict):
+            return result
+        delta_type = ame.get("type")
+        delta = ame.get("delta")
+        if delta_type == "text_delta" and isinstance(delta, str) and delta:
+            result.append(TextChunk(text=delta))
+        elif delta_type == "thinking_delta" and isinstance(delta, str):
+            result.append(ReasoningChunk(delta=delta, event_type="reasoning_text"))
+        elif delta_type == "toolcall_delta":
+            # Delta-level tool calls are informational only; lifecycle
+            # events produce the actionable ToolCallRequest/Complete.
             pass
-        elif ftype == "thinking_level_changed":
-            pass
-        elif ftype == "extension_error":
-            error = event.get("error", "OMP extension error")
-            result.append(ExecutorError(message=f"OMP extension error: {error}"))
-        elif ftype == "response":
-            # A response without a matching pending request (e.g. late prompt
-            # scheduling error) is surfaced as an error event.
-            if not event.get("success"):
-                result.append(
-                    ExecutorError(message=f"OMP command failed: {event.get('error', '')}")
+    elif ftype == "tool_execution_start":
+        name = str(event.get("toolName", ""))
+        args = event.get("arguments") if isinstance(event.get("arguments"), dict) else {}
+        if name:
+            result.append(ToolCallRequest(name=name, args=args))
+    elif ftype == "tool_execution_end":
+        status = event.get("status")
+        result_data = event.get("result") if isinstance(event.get("result"), dict) else {}
+        if status == "error":
+            result.append(
+                ToolCallComplete(
+                    name=str(event.get("toolName", "")),
+                    status=ToolCallStatus.ERROR,
+                    result=result_data,
                 )
-        elif ftype not in {"agent_start", "agent_end", "turn_start", "turn_end"}:
-            # Unknown frame type: log but do not hang. Tests assert this.
-            logger.debug("Unrecognized OMP event type %r", ftype)
-        return result
+            )
+        elif status == "cancelled":
+            result.append(
+                ToolCallComplete(
+                    name=str(event.get("toolName", "")),
+                    status=ToolCallStatus.CANCELLED,
+                    result=result_data,
+                )
+            )
+        else:
+            result.append(
+                ToolCallComplete(
+                    name=str(event.get("toolName", "")),
+                    status=ToolCallStatus.SUCCESS,
+                    result=result_data,
+                )
+            )
+    elif ftype == "model_changed":
+        # Native bridge may observe and publish metadata.
+        pass
+    elif ftype == "thinking_level_changed":
+        pass
+    elif ftype == "extension_error":
+        error = event.get("error", "OMP extension error")
+        result.append(ExecutorError(message=f"OMP extension error: {error}"))
+    elif ftype == "response":
+        # A response without a matching pending request (e.g. late prompt
+        # scheduling error) is surfaced as an error event.
+        if not event.get("success"):
+            result.append(
+                ExecutorError(message=f"OMP command failed: {event.get('error', '')}")
+            )
+    elif ftype not in {"agent_start", "agent_end", "turn_start", "turn_end"}:
+        # Unknown frame type: log but do not hang. Tests assert this.
+        logger.debug("Unrecognized OMP event type %r", ftype)
+    return result
 
 
 def _last_user_text(messages: Sequence[Message]) -> str | None:
