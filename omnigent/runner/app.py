@@ -9710,6 +9710,7 @@ def _build_spawn_env_from_spec(
             _build_goose_spawn_env,
             _build_hermes_spawn_env,
             _build_kimi_spawn_env,
+            _build_omp_spawn_env,
             _build_openai_agents_sdk_spawn_env,
             _build_pi_spawn_env,
             _build_qwen_spawn_env,
@@ -9721,6 +9722,8 @@ def _build_spawn_env_from_spec(
             env = _build_codex_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
         elif harness == "pi":
             env = _build_pi_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
+        elif harness == "omp":
+            env = _build_omp_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
         elif harness == "openai-agents":
             env = _build_openai_agents_sdk_spawn_env(effective_spec)
         elif harness == "cursor":

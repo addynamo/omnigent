@@ -523,6 +523,17 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         interrupt=True,
         streaming=True,
     ),
+    "omp": _C(
+        _IM.CLI_SUBPROCESS,
+        _EL.NONE,
+        _RS.COLD_ONLY,
+        _EF.NONE,
+        _MF.MULTI,
+        _AU.SESSION_SCOPED_CONFIG,
+        subagents=False,
+        interrupt=True,
+        streaming=True,
+    ),
     "openai-agents": _C(
         _IM.SDK_IN_PROCESS,
         _EL.NONE,
@@ -671,6 +682,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
             "kimi-native",
             "kiro-native",
             "open-responses",
+            "omp",
             "openai-agents",
             "opencode-native",
             "pi",
@@ -702,6 +714,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "kimi": "omnigent.inner.kimi_harness",
         "kimi-native": "omnigent.inner.kimi_native_harness",
         "kiro-native": "omnigent.inner.kiro_native_harness",
+        "omp": "omnigent.inner.omp_harness",
         "openai-agents": "omnigent.inner.openai_agents_sdk_harness",
         "opencode-native": "omnigent.inner.opencode_native_harness",
         "pi": "omnigent.inner.pi_harness",
@@ -786,9 +799,13 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "goose": "HARNESS_GOOSE_MODEL",
         "hermes": "HARNESS_HERMES_MODEL",
         "kimi": "HARNESS_KIMI_MODEL",
+        "omp": "HARNESS_OMP_MODEL",
         "openai-agents": "HARNESS_OPENAI_AGENTS_MODEL",
         "pi": "HARNESS_PI_MODEL",
         "qwen": "HARNESS_QWEN_MODEL",
+    },
+    spawn_env_builders={
+        "omp": "omnigent.runtime.workflow:_build_omp_spawn_env",
     },
     background_title_generators={
         "claude-sdk": BackgroundTitleGeneratorSpec(
@@ -816,6 +833,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         # stays a valid harness for YAML specs (and the credential-free
         # integration mock LLM), but is no longer offered as a UI pick.
         "pi": "Pi",
+        "omp": "OMP",
         **{name: row.label for name, row in ACP_CLI_HARNESSES.items()},
     },
     capabilities=_BUILTIN_CAPABILITIES,
