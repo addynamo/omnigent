@@ -1009,3 +1009,15 @@ async def test_model_failures_surface_as_executor_error(
     assert isinstance(events[0], ExecutorError)
     assert "model refused" in events[0].message
     await executor.close()
+
+
+async def test_line_over_default_stream_limit_is_read(tmp_path: Path) -> None:
+    # asyncio's default 64 KiB line limit must not kill the session on a long frame.
+    ready = _ready(supported_versions=[1])
+    ready["padding"] = "x" * (256 * 1024)
+    executor = _executor(tmp_path, {"ready": ready})
+    try:
+        state = await executor.get_state()
+        assert state.get("sessionFile") == "/tmp/fake.omp"
+    finally:
+        await executor.close()
