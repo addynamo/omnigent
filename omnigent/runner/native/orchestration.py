@@ -2363,6 +2363,71 @@ def _omp_terminal_launch_args(
     return profile, passthrough
 
 
+_omp_background_tasks: set[asyncio.Task[None]] = set()
+
+
+async def _persist_omp_session_file_metadata(
+    server_client: httpx.AsyncClient,
+    session_id: str,
+    bridge_dir: Path,
+    *,
+    timeout_s: float = 60.0,
+    poll_interval_s: float = 0.5,
+) -> None:
+    """Mirror the bridge-captured sessionFile onto the session as ``external_session_id``.
+
+    The session file outlives runner and bridge-dir loss, so a relaunch reads this
+    back and resumes with ``omp --resume <sessionFile>`` instead of cold-starting.
+    Best-effort, mirroring :func:`_persist_qwen_external_session_id`: a failure
+    only degrades that recovery path, never the live session.
+
+    :param server_client: Runner Omnigent server client.
+    :param session_id: Session/conversation identifier.
+    :param bridge_dir: Per-session bridge directory whose ``state.json`` the
+        bridge writes when OMP reports its ``sessionFile``.
+    :param timeout_s: How long to wait for the capture before giving up.
+    :param poll_interval_s: Delay between capture checks.
+    :returns: ``None``.
+    """
+    from omnigent.omp_native_bridge import OmpRpcBridge
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_s
+    session_file = OmpRpcBridge.stored_session_file(bridge_dir)
+    while session_file is None and loop.time() < deadline:
+        await asyncio.sleep(poll_interval_s)
+        session_file = OmpRpcBridge.stored_session_file(bridge_dir)
+    if session_file is None:
+        _logger.warning(
+            "omp-native: no sessionFile captured for %s within %.0fs; a relaunch "
+            "after losing the bridge dir will start fresh",
+            session_id,
+            timeout_s,
+        )
+        return
+    try:
+        resp = await server_client.patch(
+            f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
+            json={"external_session_id": str(session_file)},
+            timeout=10.0,
+        )
+    except (httpx.HTTPError, RuntimeError, ValueError):
+        _logger.warning(
+            "Could not record omp-native sessionFile for %s; a relaunch after "
+            "losing the bridge dir will start fresh",
+            session_id,
+            exc_info=True,
+        )
+        return
+    if resp.status_code >= 400:
+        _logger.warning(
+            "AP rejected omp-native sessionFile PATCH (%s); session=%s path=%s",
+            resp.status_code,
+            session_id,
+            session_file,
+        )
+
+
 async def _auto_create_omp_terminal(
     session_id: str,
     resource_registry: SessionResourceRegistry,
@@ -2391,7 +2456,11 @@ async def _auto_create_omp_terminal(
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
     from omnigent.inner.omp_executor import resolve_omp_executable
     from omnigent.omp_native import omp_native_terminal_command
-    from omnigent.omp_native_bridge import OmpRpcBridge, bridge_dir_for_session_id
+    from omnigent.omp_native_bridge import (
+        OmpRpcBridge,
+        _validate_session_file,
+        bridge_dir_for_session_id,
+    )
     from omnigent.runner.resource_registry import OMP_NATIVE_TERMINAL_ROLE
 
     launch_config = await _pi_native_launch_config(
@@ -2405,16 +2474,11 @@ async def _auto_create_omp_terminal(
     # the generic external_session_id only when the bridge state is absent.
     session_file: Path | None = OmpRpcBridge.stored_session_file(bridge_dir)
     if session_file is None and launch_config.external_session_id is not None:
-        candidate = Path(launch_config.external_session_id).expanduser().resolve()
-        if candidate.is_file() and os.access(candidate, os.R_OK):
-            session_file = candidate
-        else:
-            _logger.warning(
-                "omp-native: stored session file %s for %s is missing or unreadable; "
-                "launching fresh",
-                candidate,
-                session_id,
-            )
+        session_file = Path(launch_config.external_session_id)
+    if session_file is not None:
+        # Refuse to cold-start over missing durable state: launching without the
+        # resume file would silently discard the user's OMP history.
+        session_file = _validate_session_file(session_file)
 
     try:
         omp_command = resolve_omp_executable()
@@ -2473,6 +2537,13 @@ async def _auto_create_omp_terminal(
             "resource": session_resource_view_to_dict(terminal_view),
         },
     )
+    if server_client is not None:
+        task = asyncio.create_task(
+            _persist_omp_session_file_metadata(server_client, session_id, bridge_dir),
+            name=f"omp-native-session-file-{session_id}",
+        )
+        _omp_background_tasks.add(task)
+        task.add_done_callback(_omp_background_tasks.discard)
     _logger.info(
         "Auto-created omp terminal for session %s (bridge_dir=%s, session_file=%s)",
         session_id,

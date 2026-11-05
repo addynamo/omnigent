@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
 from omnigent.runner import create_runner_app
@@ -338,3 +339,103 @@ async def test_omp_native_model_change_rejects_invalid_model_id(
 
     assert resp.status_code == 400
     assert resp.json()["error"] == "omp_native_model_invalid"
+
+
+class _PatchFailingServerClient(NullServerClient):
+    """Server client whose session PATCH fails like an unreachable AP."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.patches: list[dict[str, Any]] = []
+
+    async def patch(self, url: str, **kwargs: Any) -> NullServerClient._Response:
+        body = kwargs.get("json")
+        if isinstance(body, dict):
+            self.patches.append(body)
+        raise httpx.ConnectError("AP unreachable")
+
+
+@pytest.mark.asyncio
+async def test_omp_native_model_change_reports_metadata_patch_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed metadata PATCH is reported instead of a silent 204."""
+    from omnigent import omp_config, omp_native_terminal
+
+    _patch_omp_auto_create(monkeypatch)
+    conv_id = "conv_omp_model_meta_fail"
+
+    def _fake_client_class(bridge_dir: Path) -> _FakeOmpClient:
+        return _FakeOmpClient(bridge_dir, command_results=[{"success": True}])
+
+    monkeypatch.setattr(omp_native_terminal, "OmpNativeTerminalClient", _fake_client_class)
+    monkeypatch.setattr(omp_config, "persist_omp_model", lambda *args: None)
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return _omp_spec()
+
+    server_client = _PatchFailingServerClient()
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "model_change", "model": "ollama/kimi-k2.7-code:cloud"},
+        )
+
+    assert resp.status_code == 503, resp.text
+    assert resp.json()["error"] == "omp_native_metadata_patch_failed"
+    assert server_client.patches == [{"model_override": "ollama/kimi-k2.7-code:cloud"}]
+
+
+@pytest.mark.asyncio
+async def test_omp_native_effort_change_reports_metadata_patch_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed effort metadata PATCH is reported instead of a silent 204."""
+    from omnigent import omp_config, omp_native_terminal
+
+    _patch_omp_auto_create(monkeypatch)
+    conv_id = "conv_omp_effort_meta_fail"
+
+    def _fake_client_class(bridge_dir: Path) -> _FakeOmpClient:
+        return _FakeOmpClient(bridge_dir, command_results=[{"success": True}])
+
+    monkeypatch.setattr(omp_native_terminal, "OmpNativeTerminalClient", _fake_client_class)
+    monkeypatch.setattr(omp_config, "persist_omp_thinking_level", lambda *args: None)
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return _omp_spec()
+
+    server_client = _PatchFailingServerClient()
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "effort_change", "effort": "high"},
+        )
+
+    assert resp.status_code == 503, resp.text
+    assert resp.json()["error"] == "omp_native_metadata_patch_failed"
+    assert server_client.patches == [{"reasoning_effort": "high"}]

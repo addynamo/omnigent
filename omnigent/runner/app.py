@@ -4318,7 +4318,18 @@ def create_runner_app(
                 },
             )
 
-        await _omp_native_patch_session_field(conv_id, field="model_override", value=selected)
+        if not await _omp_native_patch_session_field(
+            conv_id, field="model_override", value=selected
+        ):
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "omp_native_metadata_patch_failed",
+                    "detail": (
+                        f"OMP model applied but session metadata for {conv_id} was not updated"
+                    ),
+                },
+            )
         return Response(status_code=204)
 
     async def _handle_omp_native_effort_change(
@@ -4388,7 +4399,18 @@ def create_runner_app(
                 },
             )
 
-        await _omp_native_patch_session_field(conv_id, field="reasoning_effort", value=selected)
+        if not await _omp_native_patch_session_field(
+            conv_id, field="reasoning_effort", value=selected
+        ):
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "omp_native_metadata_patch_failed",
+                    "detail": (
+                        f"OMP effort applied but session metadata for {conv_id} was not updated"
+                    ),
+                },
+            )
         return Response(status_code=204)
 
     async def _omp_native_session_snapshot(conv_id: str) -> dict[str, Any]:
@@ -4419,14 +4441,15 @@ def create_runner_app(
         *,
         field: str,
         value: str | None,
-    ) -> None:
+    ) -> bool:
+        """Persist one OMP-native override field; ``False`` when the server did not."""
         if server_client is None:
-            return
+            return False
         # The PATCH endpoint treats "default" / "off" / "reset" as a clear
         # alias for an override field. Use it when reverting to no override.
         body: dict[str, Any] = {field: value if value is not None else "default"}
         try:
-            await server_client.patch(
+            resp = await server_client.patch(
                 f"/v1/sessions/{urllib.parse.quote(conv_id, safe='')}",
                 json=body,
                 timeout=10.0,
@@ -4435,6 +4458,16 @@ def create_runner_app(
             _logger.warning(
                 "Failed to patch OMP-native session %s field %s", conv_id, field, exc_info=True
             )
+            return False
+        if resp.status_code >= 400:
+            _logger.warning(
+                "AP rejected OMP-native session %s field %s PATCH (%s)",
+                conv_id,
+                field,
+                resp.status_code,
+            )
+            return False
+        return True
 
     async def _omp_native_revert_session_field(
         conv_id: str,
