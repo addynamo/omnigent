@@ -534,4 +534,12 @@ export interface NativeModelOption {
   supportedReasoningEfforts?: NativeReasoningEffortOption[];
   /** Whether the native catalog marks this as the default model. */
   isDefault?: boolean;
+  /** Provider key the model runs on, e.g. ``"openrouter"`` (OMP rows). */
+  provider?: string;
+  /** User-facing provider label, when the catalog supplies one. */
+  providerName?: string;
+  /** Catalog kind for OMP rows, e.g. ``"chat"``, ``"image"``, ``"search"``. */
+  kind?: string;
+  /** Thinking levels the model supports (OMP rows), e.g. ``["low", "high"]``. */
+  thinking?: string[];
 }

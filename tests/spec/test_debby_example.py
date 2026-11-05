@@ -1,4 +1,4 @@
-"""Regression guard for the Debby example's GPT head.
+"""Regression guard for the Debby example's heads.
 
 Debby's "GPT" sub-agent must run on the ``codex`` harness, not
 ``openai-agents``. The openai-agents harness treats an unpinned model as a
@@ -8,6 +8,9 @@ Databricks model (``is_databricks_model = model is None`` in
 back to ambient Databricks credentials — routing the "GPT" head through the
 Databricks gateway instead of OpenAI. The ``codex`` harness is GPT-only, uses
 OpenAI's native auth, and has no such unpinned-model Databricks fallback.
+
+Debby's "OMP" sub-agent must run on the headless ``omp`` harness, effective
+2026-11-06 when Claude was cancelled.
 
 This is a non-live parse-only check so it runs in the default suite (the
 dir-shaped example's own e2e coverage lives under ``tests/e2e``, which is
@@ -82,14 +85,12 @@ def test_packaged_debby_resource_stays_in_sync_with_source_example() -> None:
     )
 
 
-def test_debby_claude_head_unchanged() -> None:
-    """The Claude head still runs on ``claude-sdk`` (the fix is GPT-only)."""
+def test_debby_omp_head_uses_omp_harness() -> None:
+    """The OMP head runs on the headless ``omp`` harness."""
     spec = parse(_DEBBY_DIR)
     by_name = {sub.name: sub for sub in spec.sub_agents}
 
-    assert "claude" in by_name, (
-        f"Debby should declare a 'claude' sub-agent; got {sorted(by_name)}."
-    )
-    assert by_name["claude"].executor.harness_kind == "claude-sdk", (
-        "Debby's Claude head should remain on the 'claude-sdk' harness."
+    assert "omp" in by_name, f"Debby should declare an 'omp' sub-agent; got {sorted(by_name)}."
+    assert by_name["omp"].executor.harness_kind == "omp", (
+        "Debby's OMP head should run on the 'omp' harness."
     )

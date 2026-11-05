@@ -161,6 +161,72 @@ async def test_handle_model_options_uses_host_pi_configuration(
     )
 
 
+async def test_handle_model_options_tags_omp_rows_with_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OMP rows cover every catalog kind and carry provider, kind and effort ladder."""
+    from omnigent import omp_config
+    from omnigent.omp_config import NativeModelOption
+
+    kinds: list[object] = []
+
+    def _list(_profile: object, *, kind: object = None) -> list[NativeModelOption]:
+        kinds.append(kind)
+        return [
+            NativeModelOption(
+                provider="openrouter",
+                model_id="ai21/jamba-large-1.7",
+                display_name="Jamba Large 1.7",
+                thinking=["low", "high"],
+            ),
+            NativeModelOption(
+                provider="ollama",
+                model_id="glm-5.1:cloud",
+                display_name="glm-5.1:cloud",
+                provider_name="Ollama",
+            ),
+            NativeModelOption(
+                provider="openai-codex",
+                model_id="gpt-image-2",
+                display_name="GPT Image 2",
+                kind="image",
+            ),
+        ]
+
+    monkeypatch.setattr(omp_config, "list_omp_models", _list)
+    host = _make_host_process()
+
+    result = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="req_omp_models", harness="omp-native"),
+    )
+
+    assert kinds == ["all"]
+    assert result.models == [
+        {
+            "id": "openrouter/ai21/jamba-large-1.7",
+            "displayName": "Jamba Large 1.7",
+            "provider": "openrouter",
+            "kind": "chat",
+            "thinking": ["low", "high"],
+        },
+        {
+            "id": "ollama/glm-5.1:cloud",
+            "displayName": "glm-5.1:cloud",
+            "provider": "ollama",
+            "kind": "chat",
+            "thinking": [],
+            "providerName": "Ollama",
+        },
+        {
+            "id": "openai-codex/gpt-image-2",
+            "displayName": "GPT Image 2",
+            "provider": "openai-codex",
+            "kind": "image",
+            "thinking": [],
+        },
+    ]
+
+
 async def test_handle_model_options_uses_codex_provider_catalog(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

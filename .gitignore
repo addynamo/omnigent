@@ -20,6 +20,7 @@ omnigent/_build_info.py
 .codex
 .worktrees/
 .claude/worktrees/
+.superpowers/sdd/
 .tmp*
 .*/
 

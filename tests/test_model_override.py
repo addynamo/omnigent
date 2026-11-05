@@ -32,6 +32,8 @@ from omnigent.model_override import (
         "databricks/databricks-gpt-5-4",
         "vendor:tag",
         "o3",
+        "openrouter/ai21/jamba-large-1.7",
+        "openrouter/~anthropic/claude-opus-latest",
     ],
 )
 def test_validate_model_override_accepts_real_id_shapes(value: str) -> None:
@@ -64,6 +66,8 @@ def test_validate_model_override_strips_whitespace() -> None:
         # Flag-shaped values could be parsed as a CLI option.
         "--dangerously-skip-permissions",
         "-flag",
+        # Leading tilde could expand to a home directory.
+        "~anthropic/claude-opus-latest",
         # Length cap.
         "a" * (MODEL_OVERRIDE_MAX_LEN + 1),
     ],

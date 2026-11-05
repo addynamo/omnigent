@@ -1393,19 +1393,17 @@ def _write_isolated_provider_config(
 
 
 @pytest.mark.parametrize("shorthand", ["polly", "debby"])
-def test_bundled_agent_launches_with_first_available_credential(
+def test_bundled_agent_launches_without_claude_credential(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     shorthand: str,
 ) -> None:
-    """Polly/Debby launch with the first available credential (#334).
+    """Polly/Debby launch without mutating unrelated credentials (#334, OMP default).
 
-    With a Claude (``anthropic``) credential configured but NOT marked
-    ``default: true``, the shorthand must mark it the default for the
-    brain's family and proceed to launch — rather than requiring the user
-    to pick/configure a specific default up front. Both shorthands share
-    the ``_run_bundled_agent`` path and the ``claude-sdk`` brain, so the
-    fallback fires identically for each.
+    Effective 2026-11-06 the bundled orchestrators default to the ``omp``
+    harness, which does not use Claude-family credentials. An anthropic key
+    configured for legacy use must not be silently promoted to default and
+    the launch must still proceed.
     """
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
     # No ambient credentials — the explicit provider below is the only one.
@@ -1429,32 +1427,25 @@ def test_bundled_agent_launches_with_first_available_credential(
     result = CliRunner().invoke(cli, [shorthand])
 
     assert result.exit_code == 0, result.output
-    # The first available credential was promoted to the anthropic default.
-    # A single-family (anthropic-only) provider renders its default as the
-    # compact `True` form — the whole served set, per _default_raw_value.
+    # OMP brain: no credential fallback, so the anthropic provider is untouched.
     saved = yaml.safe_load((tmp_path / "config.yaml").read_text())
     provider = saved["providers"]["anthropic_key"]
-    assert provider.get("default") is True
-    # The silent config mutation is announced (mirrors setup / /model).
-    assert (
-        "No default Claude credential set — using Anthropic Key API Key and saving "
-        "it as the default (change anytime with: omnigent /model)." in result.output
-    )
-    assert "credentials found" not in result.output
-    # And the launch proceeded (the brain credential resolved).
+    assert provider.get("default") is not True
+    assert "No default Claude credential" not in result.output
+    # And the launch proceeded.
     dispatch.assert_called_once()
     assert dispatch.call_args.kwargs["target"] == _bundled_example_path(shorthand)
 
 
-def test_bundled_agent_multiple_credentials_notice_preserves_first_pick(
+def test_bundled_agent_with_multiple_credentials_does_not_prompt_or_default(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Multiple matching credentials still launch non-interactively with context.
+    """Legacy Claude-family credentials do not prompt or mutate with OMP brain.
 
-    When two Claude-family credentials exist and neither is default, the
-    shorthand remains headless-safe: it promotes the first configured
-    credential, reports the ambiguity, and tells the user where to change it.
+    Multiple anthropic credentials used to require picking a default for the
+    Claude-sdk brain. With the OMP default, the shorthand must remain
+    headless-safe and leave the provider block untouched.
     """
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
     monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
@@ -1492,13 +1483,9 @@ def test_bundled_agent_multiple_credentials_notice_preserves_first_pick(
     assert result.exit_code == 0, result.output
     saved = yaml.safe_load((tmp_path / "config.yaml").read_text())
     providers = saved["providers"]
-    assert providers["anthropic_first"].get("default") is True
-    assert "default" not in providers["anthropic_second"]
-    assert (
-        "No default Claude credential set — using Anthropic First API Key "
-        "(2 Claude credentials found; pick another with: omnigent /model) "
-        "and saving it as the default." in result.output
-    )
+    assert providers["anthropic_first"].get("default") is not True
+    assert providers["anthropic_second"].get("default") is not True
+    assert "No default Claude credential" not in result.output
     dispatch.assert_called_once()
     assert dispatch.call_args.kwargs["target"] == _bundled_example_path("polly")
 
@@ -4652,6 +4639,52 @@ def test_config_set_rejects_invalid_auto_open_conversation(
     assert result.exit_code != 0
     assert "auto_open_conversation" in result.output
     assert "must be a boolean" in result.output
+
+
+def test_config_set_global_polly_review_model(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    ``polly_review_model`` is a supported key and persists the model id verbatim.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Temporary directory standing in for ~/.omnigent.
+    """
+    config_path = tmp_path / "config.yaml"
+    monkeypatch.setattr("omnigent.cli._GLOBAL_CONFIG_PATH", config_path)
+
+    result = CliRunner().invoke(
+        cli,
+        ["config", "set", "--global", "polly_review_model=ollama/minimax-m3:cloud"],
+    )
+
+    assert result.exit_code == 0, result.output
+    cfg = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert cfg["polly_review_model"] == "ollama/minimax-m3:cloud"
+
+
+def test_config_set_rejects_invalid_polly_review_model(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A ``polly_review_model`` that is not a valid model id is rejected at set time.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Temporary directory standing in for ~/.omnigent.
+    """
+    config_path = tmp_path / "config.yaml"
+    monkeypatch.setattr("omnigent.cli._GLOBAL_CONFIG_PATH", config_path)
+
+    result = CliRunner().invoke(
+        cli,
+        ["config", "set", "--global", "polly_review_model=--evil"],
+    )
+
+    assert result.exit_code != 0
+    assert "polly_review_model" in result.output
+    assert not config_path.exists()
 
 
 def test_config_list_shows_saved_values(

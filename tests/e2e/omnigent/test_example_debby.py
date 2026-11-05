@@ -1,15 +1,15 @@
 """Structural test for the Debby two-headed brainstorming bundle (examples/debby).
 
-Debby never answers from a single model: every question is fanned out to BOTH a
-Claude sub-agent and a GPT sub-agent — two plain (non-coding) responders on the
-claude-sdk and codex harnesses — and the ``debate`` skill has them
-critique each other before converging. Pure spec-load — no LLM, no credentials —
-modeled on ``test_example_polly.py``.
+Debby never answers from a single model: every question is fanned out to BOTH
+an OMP sub-agent and a GPT sub-agent — two plain (non-coding) responders on the
+headless ``omp`` and ``codex`` harnesses — and the ``debate`` skill has them
+critique each other before converging. Pure spec-load — no LLM, no credentials
+— modeled on ``test_example_polly.py``.
 
 What breaks if this fails:
-- the two heads collapse onto one vendor (no cross-model contrast — Debby's whole
-  point), or a head is dropped entirely,
-- a head silently switches harness (e.g. the GPT head ends up on claude-sdk),
+- the two heads collapse onto one harness (no cross-model contrast — Debby's
+  whole point), or a head is dropped entirely,
+- a head silently switches harness (e.g. the GPT head ends up on openai-agents),
 - the ``debate`` skill is dropped or renamed (the critique loop regresses),
 - the ``os_env`` block disappears (the heads lose the file/shell tools the
   brainstorming surface relies on).
@@ -36,32 +36,34 @@ def debby_spec() -> AgentSpec:
 
 def test_debby_is_two_headed_cross_vendor(debby_spec: AgentSpec) -> None:
     """
-    Debby has exactly two heads — ``claude`` on claude-sdk and ``gpt`` on
-    codex — so every answer contrasts two distinct vendors.
+    Debby has exactly two heads — ``omp`` on the headless ``omp`` harness and
+    ``gpt`` on ``codex`` — so every answer contrasts two distinct
+    harnesses/providers.
 
     A missing/renamed head, or both heads landing on the same harness, removes
     the cross-model contrast that is Debby's entire reason to exist.
     """
     assert debby_spec.name == "debby"
     fam = {a.name: a.executor.config.get("harness") for a in debby_spec.sub_agents}
-    assert sorted(debby_spec.tools.agents) == ["claude", "gpt"]
-    assert fam["claude"] == "claude-sdk"
+    assert sorted(debby_spec.tools.agents) == ["gpt", "omp"]
+    assert fam["omp"] == "omp"
     assert fam["gpt"] == "codex"
-    # Two distinct vendors → the heads always disagree across providers.
+    # Two distinct harnesses → the heads always disagree across providers.
     assert len(set(fam.values())) == 2
 
 
 def test_debby_heads_are_unpinned(debby_spec: AgentSpec) -> None:
     """
-    Neither head pins a model: each inherits whatever Claude / OpenAI provider
-    the user configured (Anthropic key, subscription, gateway, or Databricks).
+    Neither head pins a model: OMP inherits whatever model the active OMP
+    profile resolves, and GPT inherits whatever OpenAI/Codex provider the user
+    configured.
 
     Un-pinning is load-bearing for OSS — a Databricks-specific model id would
     404 on a plain Anthropic / OpenAI key. Re-introducing a pin re-couples a
     head to one provider, so fail here if a model reappears.
     """
     by_name = {a.name: a for a in debby_spec.sub_agents}
-    for name in ("claude", "gpt"):
+    for name in ("omp", "gpt"):
         assert by_name[name].executor.model is None, name
         assert by_name[name].executor.profile is None, name
 

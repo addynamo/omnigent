@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import functools
 import json
 import logging
 import mimetypes
@@ -1157,6 +1158,43 @@ async def _post_child_message_event(
     )
 
 
+def _subagent_purpose_from_args(args: _JsonObject) -> str | None:
+    """
+    Return the dispatch ``purpose`` polly attaches to object-form ``args``.
+
+    :param args: Parsed ``sys_session_send`` arguments, e.g.
+        ``{"args": {"input": "review this", "purpose": "review"}}``.
+    :returns: The purpose string, or ``None`` when absent.
+    """
+    raw_message = args.get("args")
+    if not isinstance(raw_message, dict):
+        return None
+    purpose = raw_message.get("purpose")
+    return purpose if isinstance(purpose, str) else None
+
+
+def _configured_review_model(
+    *, agent_spec: AgentSpec | None, child_harness: str | None, purpose: str | None
+) -> str | None:
+    """
+    Return the user's ``polly_review_model`` for a polly review sent to an omp worker.
+
+    :param agent_spec: The dispatching (parent) spec; only ``polly`` qualifies.
+    :param child_harness: The sub-agent's resolved harness, e.g. ``"omp"``.
+    :param purpose: The dispatch purpose; only ``"review"`` qualifies.
+    :returns: The validated configured model, or ``None`` when it doesn't apply.
+    :raises ValueError: If the configured value is not a valid model id.
+    """
+    if purpose != "review" or agent_spec is None or agent_spec.name != "polly":
+        return None
+    if (canonicalize_harness(child_harness) if child_harness else None) != "omp":
+        return None
+    from omnigent.config import polly_review_model
+
+    configured = polly_review_model()
+    return validate_model_override(configured) if configured is not None else None
+
+
 def _subagent_model_from_args(args: _JsonObject) -> str | None:
     """
     Extract and validate the per-dispatch model from ``sys_session_send`` args.
@@ -1928,6 +1966,25 @@ async def _execute_subagent_tool(
         }
         if harness_override_canonical is not None:
             create_body["harness_override"] = harness_override_canonical
+        if model is None:
+            # An unpinned polly review runs on the user's configured review model.
+            try:
+                model = await asyncio.to_thread(
+                    functools.partial(
+                        _configured_review_model,
+                        agent_spec=agent_spec,
+                        child_harness=child_harness,
+                        purpose=_subagent_purpose_from_args(args),
+                    )
+                )
+            except ValueError as exc:
+                from omnigent.config import POLLY_REVIEW_MODEL_CONFIG_KEY
+
+                return (
+                    f"Error: configured {POLLY_REVIEW_MODEL_CONFIG_KEY!r} is invalid: {exc}. "
+                    "Fix it with `omnigent config set --global "
+                    f"{POLLY_REVIEW_MODEL_CONFIG_KEY}=<provider/model>`."
+                )
         if model is not None:
             # Reject up front when the child harness would silently
             # ignore the persisted override — no silent drops.
