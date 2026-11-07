@@ -16,6 +16,7 @@ from collections import deque
 from pathlib import Path
 from typing import Any, TextIO
 
+from omnigent.inner.omp_executor import OMP_RPC_LINE_LIMIT_BYTES
 from omnigent.omp_native_bridge import _read_json_line, _write_json_line
 
 
@@ -33,7 +34,7 @@ class OmpNativeTerminalClient:
     async def connect(self) -> None:
         """Connect and authenticate using the bridge's owner-only bearer token."""
         self._reader, self._writer = await asyncio.open_unix_connection(
-            str(self.bridge_dir / "bridge.sock")
+            str(self.bridge_dir / "bridge.sock"), limit=OMP_RPC_LINE_LIMIT_BYTES
         )
         token = (self.bridge_dir / "token").read_text(encoding="utf-8")
         await _write_json_line(self._writer, {"type": "authenticate", "token": token})

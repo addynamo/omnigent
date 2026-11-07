@@ -54,8 +54,9 @@ _OMP_SHUTDOWN_TIMEOUT_S = 10.0
 # any legitimate reassembly sequence while keeping allocation bounded.
 _MAX_RPC_CHUNK_COUNT = 8_192
 
-# OMP can write lines far above asyncio's 64 KiB default (state, long history).
-_OMP_STDOUT_LINE_LIMIT_BYTES = 64 * 1024 * 1024
+# OMP can write lines far above asyncio's 64 KiB default (state, long history,
+# command catalogs). Every OMP-facing stream must allow them.
+OMP_RPC_LINE_LIMIT_BYTES = 64 * 1024 * 1024
 
 # OMP model catalog JSON is emitted by ``omp models --json``; we do not try
 # to parse it here, but ``OmpProfileConfig`` (omnigent/omp_config.py) does.
@@ -221,7 +222,7 @@ class _OmpRpcSession:
                 stderr=asyncio.subprocess.PIPE,
                 cwd=cwd,
                 env=self._env,
-                limit=_OMP_STDOUT_LINE_LIMIT_BYTES,
+                limit=OMP_RPC_LINE_LIMIT_BYTES,
             )
         except Exception as exc:
             raise OmpProtocolError(

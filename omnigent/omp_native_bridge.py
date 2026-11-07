@@ -19,6 +19,8 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from omnigent.inner.omp_executor import OMP_RPC_LINE_LIMIT_BYTES
+
 OMP_NATIVE_BRIDGE_DIR_ENV_VAR = "HARNESS_OMP_NATIVE_BRIDGE_DIR"
 OMP_NATIVE_REQUEST_SESSION_ID_ENV_VAR = "HARNESS_OMP_NATIVE_REQUEST_SESSION_ID"
 
@@ -167,7 +169,7 @@ class OmpRpcBridge:
             self.socket_path.unlink()
         _write_owner_only(self.token_path, secrets.token_urlsafe(32))
         self._server = await asyncio.start_unix_server(
-            self._accept_client, path=str(self.socket_path)
+            self._accept_client, path=str(self.socket_path), limit=OMP_RPC_LINE_LIMIT_BYTES
         )
         os.chmod(self.socket_path, 0o600)
         self._process = await self._process_factory(
@@ -177,6 +179,7 @@ class OmpRpcBridge:
             stderr=asyncio.subprocess.PIPE,
             cwd=self._cwd,
             env=self._env,
+            limit=OMP_RPC_LINE_LIMIT_BYTES,
         )
         self._reader_task = asyncio.create_task(
             self._read_omp(), name=f"omp-native-{self.session_id}"
