@@ -40,7 +40,9 @@ import {
 import {
   Select,
   SelectContent,
+  SelectGroup,
   SelectItem,
+  SelectLabel,
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
@@ -181,6 +183,15 @@ import { useNativeServerSwitcherForMainSurface } from "@/hooks/useNativeServerSw
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 import type { Conversation } from "@/hooks/useConversations";
 import type { NativeModelOption } from "@/lib/types";
+import {
+  OMP_ROLES,
+  OMP_SESSION_ONLY,
+  ompEffortLabel,
+  ompEffortOptions,
+  ompLaunchFields,
+  ompModelsForRole,
+  ompRoleUsesEffort,
+} from "@/lib/ompRoles";
 import {
   useProjectConfig,
   useProjects,
@@ -1378,6 +1389,151 @@ export function AgentHarnessPicker({
   );
 }
 
+/**
+ * OMP's "Apply to" / Model / Effort rows. A role filters the models to the kinds
+ * it accepts; effort shows only for chat-type targets and the model's own ladder.
+ */
+function OmpRoleRows({
+  role,
+  model,
+  effort,
+  options,
+  loading,
+  onRoleChange,
+  onModelChange,
+  onEffortChange,
+}: {
+  role: string;
+  model: string;
+  effort: string;
+  options: readonly SearchableModelOption[];
+  loading: boolean;
+  onRoleChange: (role: string) => void;
+  onModelChange: (model: string) => void;
+  onEffortChange: (effort: string) => void;
+}) {
+  const roleModels = useMemo(() => ompModelsForRole(options, role), [options, role]);
+  const efforts = ompRoleUsesEffort(role)
+    ? ompEffortOptions(roleModels.find((option) => option.id === model))
+    : [];
+  const changeRole = (next: string) => {
+    onRoleChange(next);
+    // Drop picks the new role can't use (another kind of model, or its effort).
+    const nextModels = ompModelsForRole(options, next);
+    const keptModel = nextModels.find((option) => option.id === model);
+    if (!keptModel) onModelChange("");
+    if (!ompRoleUsesEffort(next) || !ompEffortOptions(keptModel).includes(effort)) {
+      onEffortChange("");
+    }
+  };
+  const changeModel = (next: string) => {
+    const nextModel = next === MODEL_SELECT_DEFAULT ? "" : next;
+    onModelChange(nextModel);
+    const picked = roleModels.find((option) => option.id === nextModel);
+    if (!ompEffortOptions(picked).includes(effort)) onEffortChange("");
+  };
+  const roleItems = (group: "chat" | "kind") =>
+    OMP_ROLES.filter((r) => r.group === group).map((r) => (
+      <SelectItem key={r.id} value={r.id} title={r.description}>
+        {r.label}
+      </SelectItem>
+    ));
+
+  return (
+    <>
+      <ConfigRow
+        label="Apply to"
+        description="This session, or save as an OMP role"
+        controlClassName="sm:w-80"
+      >
+        <Select
+          value={role || OMP_ROLE_SESSION_VALUE}
+          onValueChange={(v) => changeRole(v === OMP_ROLE_SESSION_VALUE ? OMP_SESSION_ONLY : v)}
+        >
+          <SelectTrigger
+            className="w-full cursor-pointer"
+            data-testid="new-chat-landing-config-omp-role"
+            aria-label="Apply to"
+          >
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent position="popper" align="start" className="max-h-80">
+            <SelectItem value={OMP_ROLE_SESSION_VALUE}>This session only</SelectItem>
+            <SelectGroup>
+              <SelectLabel>Chat roles</SelectLabel>
+              {roleItems("chat")}
+            </SelectGroup>
+            <SelectGroup>
+              <SelectLabel>Model-kind roles</SelectLabel>
+              {roleItems("kind")}
+            </SelectGroup>
+          </SelectContent>
+        </Select>
+      </ConfigRow>
+      <ConfigRow label="Model" description="Underlying model" controlClassName="sm:w-80">
+        <SearchableModelPicker
+          value={model || MODEL_SELECT_DEFAULT}
+          options={roleModels}
+          loading={loading}
+          onValueChange={changeModel}
+        />
+      </ConfigRow>
+      {efforts.length > 0 && (
+        <ConfigRow label="Effort" description="Thinking level" controlClassName="sm:w-80">
+          <Select
+            value={effort || EFFORT_SELECT_NONE}
+            onValueChange={(v) => onEffortChange(v === EFFORT_SELECT_NONE ? "" : v)}
+          >
+            <SelectTrigger
+              className="w-full cursor-pointer"
+              data-testid="new-chat-landing-config-effort"
+              aria-label="Thinking level"
+            >
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent position="popper" align="start">
+              <SelectItem value={EFFORT_SELECT_NONE}>Default</SelectItem>
+              {efforts.map((level) => (
+                <SelectItem key={level} value={level}>
+                  {ompEffortLabel(level)}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </ConfigRow>
+      )}
+    </>
+  );
+}
+
+/** Radix Select can't hold an empty value, so "this session only" uses a sentinel. */
+const OMP_ROLE_SESSION_VALUE = "__omp_session_only__";
+
+/** A row in the searchable model picker; ``provider`` is shown beside the name. */
+interface SearchableModelOption {
+  id: string;
+  displayName: string;
+  provider?: string;
+  /** OMP catalog kind (``chat``, ``image``, ``search``, ...). */
+  kind?: string;
+  /** Thinking levels the model supports. */
+  thinking?: readonly string[];
+}
+
+/** Map a host catalog row to a picker row, labelling its provider. */
+function toSearchableModelOption(option: NativeModelOption): SearchableModelOption {
+  const slash = option.id.indexOf("/");
+  const provider =
+    option.providerName ?? option.provider ?? (slash > 0 ? option.id.slice(0, slash) : undefined);
+  return {
+    id: option.id,
+    displayName: option.displayName ?? option.id,
+    provider,
+    kind: option.kind,
+    thinking: option.thinking,
+  };
+}
+
 function SearchableModelPicker({
   value,
   options,
@@ -1385,15 +1541,15 @@ function SearchableModelPicker({
   onValueChange,
 }: {
   value: string;
-  options: readonly { id: string; displayName: string }[];
+  options: readonly SearchableModelOption[];
   loading: boolean;
   onValueChange: (value: string) => void;
 }) {
   const [open, setOpen] = useState(false);
+  const selectedOption =
+    value === MODEL_SELECT_DEFAULT ? undefined : options.find((option) => option.id === value);
   const selectedLabel =
-    value === MODEL_SELECT_DEFAULT
-      ? "Default"
-      : (options.find((option) => option.id === value)?.displayName ?? value);
+    value === MODEL_SELECT_DEFAULT ? "Default" : (selectedOption?.displayName ?? value);
   const select = (nextValue: string) => {
     onValueChange(nextValue);
     setOpen(false);
@@ -1412,6 +1568,11 @@ function SearchableModelPicker({
           data-testid="new-chat-landing-config-model"
         >
           <span className="min-w-0 truncate">{selectedLabel}</span>
+          {selectedOption?.provider && (
+            <span className="ml-auto shrink-0 text-xs text-muted-foreground">
+              {selectedOption.provider}
+            </span>
+          )}
           <ChevronDownIcon className="size-4 shrink-0 text-muted-foreground" />
         </Button>
       </PopoverTrigger>
@@ -1439,13 +1600,20 @@ function SearchableModelPicker({
               <CommandItem
                 key={option.id}
                 value={option.id}
-                keywords={[option.displayName]}
+                keywords={
+                  option.provider ? [option.displayName, option.provider] : [option.displayName]
+                }
                 title={option.displayName}
                 data-model-id={option.id}
                 data-checked={value === option.id}
                 onSelect={() => select(option.id)}
               >
-                <span className="min-w-0 truncate">{option.displayName}</span>
+                <span className="min-w-0 flex-1 truncate">{option.displayName}</span>
+                {option.provider && (
+                  <span className="ml-2 shrink-0 text-xs text-muted-foreground">
+                    {option.provider}
+                  </span>
+                )}
               </CommandItem>
             ))}
             {!loading && <CommandEmpty>No models found</CommandEmpty>}
@@ -1494,10 +1662,11 @@ function HarnessConfigModal({
   claudeModelsLoading,
   codexModelOptions,
   codexModelsLoading,
-  piModelOptions,
-  piModelsLoading,
+  searchableModelOptions,
+  searchableModelsLoading,
   pickedEffort,
   pickedHarness,
+  pickedOmpRole,
   costControlMode,
   setPermissionMode,
   setApprovalMode,
@@ -1507,6 +1676,7 @@ function HarnessConfigModal({
   setPickedModel,
   setPickedEffort,
   setPickedHarness,
+  setPickedOmpRole,
   setCostControlMode,
 }: {
   open: boolean;
@@ -1526,10 +1696,13 @@ function HarnessConfigModal({
   claudeModelsLoading: boolean;
   codexModelOptions: readonly Pick<NativeModelOption, "id" | "displayName" | "isDefault">[];
   codexModelsLoading: boolean;
-  piModelOptions: readonly { id: string; displayName: string }[];
-  piModelsLoading: boolean;
+  /** Host catalog for the searchable picker (Pi, OMP), matched to the agent's harness. */
+  searchableModelOptions: readonly SearchableModelOption[];
+  searchableModelsLoading: boolean;
   pickedEffort: string;
   pickedHarness: string | null;
+  /** OMP role the picked model is saved to; ``OMP_SESSION_ONLY`` saves nothing. */
+  pickedOmpRole: string;
   costControlMode: CostControlMode;
   setPermissionMode: (mode: string) => void;
   setApprovalMode: (mode: string) => void;
@@ -1539,6 +1712,7 @@ function HarnessConfigModal({
   setPickedModel: (model: string) => void;
   setPickedEffort: (effort: string) => void;
   setPickedHarness: (harness: string | null, agentId?: string) => void;
+  setPickedOmpRole: (role: string) => void;
   setCostControlMode: (mode: CostControlMode) => void;
 }) {
   const info = useServerInfo();
@@ -1551,6 +1725,7 @@ function HarnessConfigModal({
   const hasAgySkip = nativeAgentHasCapability(agent, "skipPermissions");
   const hasModelPicker = nativeAgentHasCapability(agent, "modelPicker");
   const isCodex = entryHarness === "codex-native";
+  const isOmp = entryHarness === "omp-native";
   const brainDefault =
     agent.harness != null && agent.harness in brainHarnessLabels ? agent.harness : null;
 
@@ -1565,6 +1740,7 @@ function HarnessConfigModal({
   const [draftBypass, setDraftBypass] = useState(bypassSandbox);
   const [draftHarness, setDraftHarness] = useState<string | null>(pickedHarness);
   const [draftRouting, setDraftRouting] = useState<CostControlMode>(costControlMode);
+  const [draftOmpRole, setDraftOmpRole] = useState(pickedOmpRole);
 
   useEffect(() => {
     if (!open) return;
@@ -1577,6 +1753,7 @@ function HarnessConfigModal({
     setDraftBypass(bypassSandbox);
     setDraftHarness(pickedHarness);
     setDraftRouting(costControlMode);
+    setDraftOmpRole(pickedOmpRole);
     // Seed once per open from the current live values.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
@@ -1650,7 +1827,15 @@ function HarnessConfigModal({
         });
     } else if (hasModelPicker) {
       setPickedModel(draftModel);
-      if (entryHarness) writeHarnessOption(entryHarness, { model: draftModel });
+      if (isOmp) {
+        setPickedEffort(draftEffort);
+        setPickedOmpRole(draftOmpRole);
+      }
+      if (entryHarness)
+        writeHarnessOption(entryHarness, {
+          model: draftModel,
+          ...(isOmp ? { effort: draftEffort } : {}),
+        });
     } else if (hasApproval) {
       if (isCodex) setPickedModel(draftModel);
       setApprovalMode(draftApproval);
@@ -1706,7 +1891,7 @@ function HarnessConfigModal({
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
-        className={cn("sm:max-w-md", entryHarness === "pi-native" && "sm:max-w-xl")}
+        className={cn("sm:max-w-md", (entryHarness === "pi-native" || isOmp) && "sm:max-w-xl")}
         data-testid="new-chat-landing-config-modal"
       >
         <DialogHeader>
@@ -1717,12 +1902,25 @@ function HarnessConfigModal({
         </DialogHeader>
 
         <div className="flex flex-col gap-5 py-1">
-          {!autoRouting && hasModelPicker && !hasPermission && (
+          {!autoRouting && isOmp && (
+            <OmpRoleRows
+              role={draftOmpRole}
+              model={draftModel}
+              effort={draftEffort}
+              options={searchableModelOptions}
+              loading={searchableModelsLoading}
+              onRoleChange={setDraftOmpRole}
+              onModelChange={setDraftModel}
+              onEffortChange={setDraftEffort}
+            />
+          )}
+
+          {!autoRouting && hasModelPicker && !hasPermission && !isOmp && (
             <ConfigRow label="Model" description="Underlying LLM" controlClassName="sm:w-80">
               <SearchableModelPicker
                 value={modelValue}
-                options={piModelOptions}
-                loading={piModelsLoading}
+                options={searchableModelOptions}
+                loading={searchableModelsLoading}
                 onValueChange={onModelChange}
               />
             </ConfigRow>
@@ -2242,13 +2440,7 @@ export function NewChatLandingScreen() {
     [hostCodexModelOptions, sandboxSelected],
   );
   const piModelOptions = useMemo(
-    () =>
-      sandboxSelected
-        ? []
-        : (hostPiModelOptions ?? []).map((option) => ({
-            id: option.id,
-            displayName: option.displayName ?? option.id,
-          })),
+    () => (sandboxSelected ? [] : (hostPiModelOptions ?? []).map(toSearchableModelOption)),
     [hostPiModelOptions, sandboxSelected],
   );
   // Desktop-shell host status for THIS machine (null outside Electron), so the
@@ -2350,6 +2542,8 @@ export function NewChatLandingScreen() {
   // via the harness-seed effect below).
   const [pickedModel, _setPickedModel] = useState<string>(() => landingDraft?.pickedModel ?? "");
   const [pickedEffort, setPickedEffort] = useState<string>(() => landingDraft?.pickedEffort ?? "");
+  // OMP role the picked model is saved to at launch; "" runs it for this session only.
+  const [pickedOmpRole, setPickedOmpRole] = useState<string>(OMP_SESSION_ONLY);
   // Per-session cost-control switch ("Cost Optimized" pill). Unset
   // (null) defers to the agent spec's default and is omitted from
   // the create body.
@@ -2787,6 +2981,22 @@ export function NewChatLandingScreen() {
     [agentList, effectiveAgentId, pendingAgent],
   );
   const selectedNativeHarness = nativeCodingAgentForAvailableAgent(selectedAgent)?.harness ?? null;
+  // OMP's catalog is large and slow to list, so fetch it only while OMP is selected.
+  const { data: hostOmpModelOptions, isLoading: hostOmpModelsLoading } = useHostModelOptions(
+    selectedHostId,
+    "omp-native",
+    !sandboxSelected && selectedNativeHarness === "omp-native",
+  );
+  const ompModelOptions = useMemo(
+    () => (sandboxSelected ? [] : (hostOmpModelOptions ?? []).map(toSearchableModelOption)),
+    [hostOmpModelOptions, sandboxSelected],
+  );
+  const isOmpSelected = selectedNativeHarness === "omp-native";
+  const searchableModelOptions = isOmpSelected ? ompModelOptions : piModelOptions;
+  const searchableModelsLoading =
+    !sandboxSelected &&
+    selectedHostId !== null &&
+    (isOmpSelected ? hostOmpModelsLoading : hostPiModelsLoading);
   const supportsPermissionMode = nativeAgentHasCapability(selectedAgent, "permissionMode");
   const supportsApprovalMode = nativeAgentHasCapability(selectedAgent, "approvalMode");
   const supportsCursorMode = nativeAgentHasCapability(selectedAgent, "cursorMode");
@@ -2862,8 +3072,17 @@ export function NewChatLandingScreen() {
     }
     if (supportsModelPicker && !supportsPermissionMode) {
       const modelValue =
-        piModelOptions.find((model) => model.id === pickedModel)?.displayName ?? "Default";
-      return [{ label: "Model", value: modelValue }];
+        searchableModelOptions.find((model) => model.id === pickedModel)?.displayName ?? "Default";
+      if (selectedNativeHarness !== "omp-native") return [{ label: "Model", value: modelValue }];
+      const roleLabel =
+        OMP_ROLES.find((role) => role.id === pickedOmpRole)?.label ?? "This session only";
+      return [
+        { label: "Apply to", value: roleLabel },
+        { label: "Model", value: modelValue },
+        ...(pickedEffort && ompRoleUsesEffort(pickedOmpRole)
+          ? [{ label: "Effort", value: ompEffortLabel(pickedEffort) }]
+          : []),
+      ];
     }
     if (supportsPermissionMode) {
       const modelValue = routingOn
@@ -2945,7 +3164,7 @@ export function NewChatLandingScreen() {
     pickedModel,
     claudeModelOptions,
     codexModelOptions,
-    piModelOptions,
+    searchableModelOptions,
     pickedEffort,
     permissionMode,
     approvalMode,
@@ -2953,6 +3172,8 @@ export function NewChatLandingScreen() {
     cursorExecMode,
     agySkipMode,
     pickedHarness,
+    pickedOmpRole,
+    selectedNativeHarness,
   ]);
   // Reset per-agent-instance run-config that must not carry across an agent
   // change. The DANGEROUS Codex bypass re-opts-in per context (matching the
@@ -2995,12 +3216,18 @@ export function NewChatLandingScreen() {
     // this holds on every run of this effect — including the re-run when the
     // model catalog resolves, which lands after the routing seed below.
     const storedRoutingOn = stored.routing === "on";
-    if (selectedNativeHarness === "pi-native") {
-      setPickedModel(
-        stored.model != null && piModelOptions.some((model) => model.id === stored.model)
-          ? stored.model
-          : "",
-      );
+    if (selectedNativeHarness === "pi-native" || selectedNativeHarness === "omp-native") {
+      const storedModel = searchableModelOptions.find((model) => model.id === stored.model);
+      setPickedModel(storedModel ? storedModel.id : "");
+      if (selectedNativeHarness === "omp-native") {
+        // Role saves are one-off actions, so a new session starts on "this session only".
+        setPickedOmpRole(OMP_SESSION_ONLY);
+        setPickedEffort(
+          stored.effort != null && ompEffortOptions(storedModel).includes(stored.effort)
+            ? stored.effort
+            : "",
+        );
+      }
     }
     if (supportsPermissionMode) {
       setPermissionMode(
@@ -3046,7 +3273,7 @@ export function NewChatLandingScreen() {
     // Reseed on harness changes and when the selected host's catalog resolves;
     // capability flags are derived from the same harness and stay omitted.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedNativeHarness, claudeModelOptions, codexModelOptions, piModelOptions]);
+  }, [selectedNativeHarness, claudeModelOptions, codexModelOptions, searchableModelOptions]);
   // Smart Routing is remembered per harness alongside the mode/model
   // knobs, in its own effect because eligibility depends on the server flag
   // (which resolves after mount — this must reseed when it lands). A stored
@@ -3817,9 +4044,17 @@ export function NewChatLandingScreen() {
       // move sets, so the row groups under its project from its very first
       // sidebar appearance instead of flashing through the ungrouped "Sessions"
       // section while the search-indexed session list catches up to the move.
+      // OMP: "this session only" runs model:effort; a role is saved by the runner.
+      const ompFields =
+        nativeAgent?.harness === "omp-native"
+          ? ompLaunchFields(pickedOmpRole, pickedModel, pickedEffort)
+          : null;
+      const ompLabels =
+        ompFields && Object.keys(ompFields.labels).length > 0 ? ompFields.labels : null;
+      const labelsWithOmp = ompLabels ? { ...(baseLabels ?? {}), ...ompLabels } : baseLabels;
       const createLabels = selectedProject
-        ? { ...(baseLabels ?? {}), [PROJECT_LABEL_KEY]: selectedProject }
-        : baseLabels;
+        ? { ...(labelsWithOmp ?? {}), [PROJECT_LABEL_KEY]: selectedProject }
+        : labelsWithOmp;
 
       let data: { id: string };
 
@@ -3933,12 +4168,14 @@ export function NewChatLandingScreen() {
             // terminal launch; an unselected ("") knob is omitted so the
             // harness keeps its own configured/default model.
             model_override:
-              !smartRoutingHarnessSelected &&
-              !routingOwnsModel &&
-              (agentSupportsModelPicker || nativeAgent?.harness === "codex-native") &&
-              pickedModel
-                ? pickedModel
-                : undefined,
+              smartRoutingHarnessSelected || routingOwnsModel
+                ? undefined
+                : ompFields
+                  ? ompFields.modelOverride
+                  : (agentSupportsModelPicker || nativeAgent?.harness === "codex-native") &&
+                      pickedModel
+                    ? pickedModel
+                    : undefined,
             reasoning_effort:
               !smartRoutingHarnessSelected &&
               !routingOwnsModel &&
@@ -4515,12 +4752,11 @@ export function NewChatLandingScreen() {
                     codexModelsLoading={
                       !sandboxSelected && selectedHostId !== null && hostCodexModelsLoading
                     }
-                    piModelOptions={piModelOptions}
-                    piModelsLoading={
-                      !sandboxSelected && selectedHostId !== null && hostPiModelsLoading
-                    }
+                    searchableModelOptions={searchableModelOptions}
+                    searchableModelsLoading={searchableModelsLoading}
                     pickedEffort={pickedEffort}
                     pickedHarness={pickedHarness}
+                    pickedOmpRole={pickedOmpRole}
                     costControlMode={costControlMode}
                     setPermissionMode={setPermissionMode}
                     setApprovalMode={setApprovalMode}
@@ -4530,6 +4766,7 @@ export function NewChatLandingScreen() {
                     setPickedModel={setPickedModel}
                     setPickedEffort={setPickedEffort}
                     setPickedHarness={handleSetPickedHarness}
+                    setPickedOmpRole={setPickedOmpRole}
                     setCostControlMode={setCostControlMode}
                   />
                 )}

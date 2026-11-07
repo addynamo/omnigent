@@ -15,7 +15,8 @@ export type NativeCodingAgentIconKind =
   | "qwen"
   | "antigravity"
   | "kimi"
-  | "hermes";
+  | "hermes"
+  | "omp";
 export type NativeCodingAgentCapability =
   "permissionMode" | "approvalMode" | "cursorMode" | "skipPermissions" | "modelPicker";
 
@@ -179,6 +180,20 @@ export const NATIVE_CODING_AGENTS = [
     displayName: "Hermes",
     iconKind: "hermes",
     sortRank: 80,
+  },
+  {
+    // Oh My Pi (OMP) native terminal wrapper. No brand glyph yet, so it falls
+    // back to the generic bot icon. The runner exposes live model options via
+    // the `/v1/sessions/{id}/omp-model-options` route and persists choices
+    // through the OMP CLI, so the model picker is surfaced here.
+    key: "omp",
+    agentName: "omp-native-ui",
+    harness: "omp-native",
+    wrapperLabel: "omp-native-ui",
+    displayName: "OMP",
+    iconKind: "omp",
+    sortRank: 85,
+    capabilities: ["modelPicker"],
   },
 ] as const satisfies readonly NativeCodingAgentSpec[];
 

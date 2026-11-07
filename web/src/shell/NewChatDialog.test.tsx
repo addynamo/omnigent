@@ -1498,6 +1498,188 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByText("Bypass permissions")).toBeTruthy();
   });
 
+  it("offers the host's OMP catalog, not Pi's, in the OMP model picker", () => {
+    useHostModelOptionsMock.mockImplementation(
+      (_hostId, harness) =>
+        (harness === "omp-native"
+          ? {
+              data: [
+                { id: "ollama/glm-5.1:cloud", displayName: "GLM 5.1" },
+                { id: "openrouter/ai21/jamba-large-1.7", displayName: "Jamba Large 1.7" },
+              ],
+              isLoading: false,
+              isError: false,
+            }
+          : harness === "pi-native"
+            ? {
+                data: [{ id: "pi/only-model", displayName: "Pi Only" }],
+                isLoading: false,
+                isError: false,
+              }
+            : CLAUDE_MODEL_OPTIONS_RESULT) as unknown as ReturnType<typeof useHostModelOptions>,
+    );
+    mockAgents([
+      {
+        id: "a_omp",
+        name: "omp-native-ui",
+        display_name: "OMP",
+        description: null,
+        harness: "omp-native",
+        skills: [],
+      },
+    ]);
+    renderLanding();
+    fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
+    openSelect("new-chat-landing-config-model");
+
+    expect(screen.getByText("GLM 5.1")).toBeTruthy();
+    expect(screen.getByText("Jamba Large 1.7")).toBeTruthy();
+    expect(screen.queryByText("Pi Only")).toBeNull();
+    expect(useHostModelOptionsMock).toHaveBeenCalledWith("host_1", "omp-native", true);
+  });
+
+  it("shows and searches each OMP model's provider in the picker", () => {
+    useHostModelOptionsMock.mockImplementation(
+      (_hostId, harness) =>
+        (harness === "omp-native"
+          ? {
+              data: [
+                { id: "openrouter/z-ai/glm-4.5", displayName: "GLM 4.5", provider: "openrouter" },
+                {
+                  id: "ollama/glm-5.1:cloud",
+                  displayName: "glm-5.1:cloud",
+                  provider: "ollama",
+                  providerName: "Ollama",
+                },
+                // No provider fields: the label falls back to the id's prefix.
+                { id: "github-copilot/gpt-5.6", displayName: "GPT-5.6" },
+              ],
+              isLoading: false,
+              isError: false,
+            }
+          : CLAUDE_MODEL_OPTIONS_RESULT) as unknown as ReturnType<typeof useHostModelOptions>,
+    );
+    mockAgents([
+      {
+        id: "a_omp",
+        name: "omp-native-ui",
+        display_name: "OMP",
+        description: null,
+        harness: "omp-native",
+        skills: [],
+      },
+    ]);
+    renderLanding();
+    fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
+    openSelect("new-chat-landing-config-model");
+
+    const row = (id: string) => document.querySelector(`[data-model-id="${id}"]`);
+    expect(row("openrouter/z-ai/glm-4.5")?.textContent).toContain("openrouter");
+    expect(row("ollama/glm-5.1:cloud")?.textContent).toContain("Ollama");
+    expect(row("github-copilot/gpt-5.6")?.textContent).toContain("github-copilot");
+
+    fireEvent.change(screen.getByTestId("new-chat-landing-config-model-search"), {
+      target: { value: "Ollama" },
+    });
+    expect(row("ollama/glm-5.1:cloud")).toBeTruthy();
+    expect(row("github-copilot/gpt-5.6")).toBeNull();
+
+    fireEvent.click(row("ollama/glm-5.1:cloud") as Element);
+    const trigger = screen.getByTestId("new-chat-landing-config-model");
+    expect(trigger.textContent).toContain("glm-5.1:cloud");
+    expect(trigger.textContent).toContain("Ollama");
+  });
+
+  describe("OMP roles and effort", () => {
+    const OMP_CATALOG = {
+      data: [
+        {
+          id: "ollama/glm-5.1:cloud",
+          displayName: "glm-5.1:cloud",
+          provider: "ollama",
+          kind: "chat",
+          thinking: ["low", "high", "max"],
+        },
+        {
+          id: "openai-codex/gpt-image-2",
+          displayName: "GPT Image 2",
+          provider: "openai-codex",
+          kind: "image",
+          thinking: [],
+        },
+      ],
+      isLoading: false,
+      isError: false,
+    };
+
+    function setUpOmp(): void {
+      authenticatedFetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({ id: "conv_new" }),
+      } as unknown as Response);
+      useHostModelOptionsMock.mockImplementation(
+        (_hostId, harness) =>
+          (harness === "omp-native"
+            ? OMP_CATALOG
+            : CLAUDE_MODEL_OPTIONS_RESULT) as unknown as ReturnType<typeof useHostModelOptions>,
+      );
+      mockAgents([
+        {
+          id: "a_omp",
+          name: "omp-native-ui",
+          display_name: "OMP",
+          description: null,
+          harness: "omp-native",
+          skills: [],
+        },
+      ]);
+      renderLanding();
+      fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
+    }
+
+    const modelRow = (id: string) => document.querySelector(`[data-model-id="${id}"]`);
+
+    it("runs this session on the picked chat model and effort, saving no role", async () => {
+      setUpOmp();
+      expect(screen.getByTestId("new-chat-landing-config-omp-role").textContent).toContain(
+        "This session only",
+      );
+      openSelect("new-chat-landing-config-model");
+      expect(modelRow("openai-codex/gpt-image-2")).toBeNull();
+      fireEvent.click(modelRow("ollama/glm-5.1:cloud") as Element);
+
+      openSelect("new-chat-landing-config-effort");
+      for (const label of ["Off", "Low", "High", "Max", "Auto"]) {
+        expect(screen.getByRole("option", { name: label })).toBeTruthy();
+      }
+      expect(screen.queryByRole("option", { name: "Medium" })).toBeNull();
+      fireEvent.click(screen.getByRole("option", { name: "High" }));
+      saveConfig();
+
+      const { body } = await submitAndReadBody();
+      expect(body.model_override).toBe("ollama/glm-5.1:cloud:high");
+      const labels = (body.labels ?? {}) as Record<string, string>;
+      expect(labels["omnigent.omp.assign_role"]).toBeUndefined();
+    });
+
+    it("assigns an image model to the image role without changing this session's model", async () => {
+      setUpOmp();
+      pickSelectOption("new-chat-landing-config-omp-role", "Image");
+      expect(screen.queryByTestId("new-chat-landing-config-effort")).toBeNull();
+      openSelect("new-chat-landing-config-model");
+      expect(modelRow("ollama/glm-5.1:cloud")).toBeNull();
+      fireEvent.click(modelRow("openai-codex/gpt-image-2") as Element);
+      saveConfig();
+
+      const { body } = await submitAndReadBody();
+      expect(body.model_override).toBeUndefined();
+      expect(body.labels).toMatchObject({
+        "omnigent.omp.assign_role": "image",
+        "omnigent.omp.assign_model": "openai-codex/gpt-image-2",
+      });
+    });
+  });
+
   it("shows the Codex approval-mode knob in the gear modal", () => {
     renderLanding();
     // Open Codex's (a2) config modal — it carries the approval-mode select.

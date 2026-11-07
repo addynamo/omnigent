@@ -123,6 +123,7 @@ export type ConversationIconKind =
   | "kimi"
   | "hermes"
   | "nessie"
+  | "omp"
   | null;
 
 // Display label for a session with no title and no native-wrapper name —

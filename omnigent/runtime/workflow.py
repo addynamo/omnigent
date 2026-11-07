@@ -1419,6 +1419,45 @@ def _build_pi_spawn_env(
     return env
 
 
+def _build_omp_spawn_env(
+    spec: AgentSpec,
+    *,
+    cwd: Path | None = None,
+    workdir: Path | None = None,
+) -> dict[str, str]:
+    """
+    Build the env-var dict the omp harness wrap reads.
+
+    Maps spec.executor fields → the ``HARNESS_OMP_*`` env vars
+    defined in ``omnigent/inner/omp_harness.py``. Mirrors
+    :func:`_build_pi_spawn_env` without the gateway/Databricks
+    branches: OMP owns its own profile, model, and auth configuration.
+
+    :param spec: The agent spec.
+    :param cwd: Runtime working directory for the OMP CLI.
+    :param workdir: The bundle's on-disk path for bundled skills.
+    :returns: A dict of env-var overrides.
+    """
+    env: dict[str, str] = {}
+    model = _resolve_spec_model(spec)
+    if model is not None:
+        env["HARNESS_OMP_MODEL"] = model
+
+    # Skills bridge — same shape as the pi / claude-sdk / codex variants.
+    env["HARNESS_OMP_SKILLS_FILTER"] = json.dumps(spec.skills_filter)
+    if spec.name:
+        env["HARNESS_OMP_AGENT_NAME"] = spec.name
+    if cwd is not None:
+        env["HARNESS_OMP_CWD"] = str(cwd)
+    if workdir is not None:
+        env["HARNESS_OMP_BUNDLE_DIR"] = str(workdir)
+    os_env_payload = _serialize_os_env(spec.os_env)
+    if os_env_payload is not None:
+        env["HARNESS_OMP_OS_ENV"] = os_env_payload
+    _apply_harness_path_override(env, "omp")
+    return env
+
+
 def _build_qwen_spawn_env(
     spec: AgentSpec,
     *,

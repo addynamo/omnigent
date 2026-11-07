@@ -507,6 +507,7 @@ class _PiNativeLaunchConfig:
     fork_source_external_id: str | None = None
     fork_carry_history: bool = False
     model_override: str | None = None
+    labels: Mapping[str, str] = dataclasses.field(default_factory=dict)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -923,6 +924,11 @@ async def _pi_native_launch_config(
         fork_source_external_id=fork_source_external_id,
         fork_carry_history=fork_carry_history,
         model_override=model_override,
+        labels=(
+            {k: v for k, v in labels.items() if isinstance(k, str) and isinstance(v, str)}
+            if isinstance(labels, dict)
+            else {}
+        ),
     )
 
 
@@ -2284,6 +2290,267 @@ async def _post_pi_native_credential_warning(
             session_id,
             exc_info=True,
         )
+
+
+# Session labels carrying a browser role assignment, saved to OMP's ``modelRoles``.
+OMP_ASSIGN_ROLE_LABEL_KEY = "omnigent.omp.assign_role"
+OMP_ASSIGN_MODEL_LABEL_KEY = "omnigent.omp.assign_model"
+
+
+def _apply_omp_role_assignment(
+    labels: Mapping[str, str],
+    profile: str | None,
+    *,
+    fresh: bool,
+    persist: Callable[..., object],
+) -> bool:
+    """
+    Save the session's browser role assignment into OMP's config on first launch.
+
+    Only fresh launches save, so a relaunch never overwrites a later TUI change.
+    A failed save is logged and the session still launches.
+
+    :param labels: Session labels, e.g. ``{OMP_ASSIGN_ROLE_LABEL_KEY: "slow", ...}``.
+    :param profile: OMP profile the bridge launches with, e.g. ``"work"``.
+    :param fresh: Whether this launch starts a new OMP session (no resume file).
+    :param persist: ``persist_omp_role(profile, role, selector)``-shaped writer.
+    :returns: Whether the assignment was saved.
+    """
+    role = labels.get(OMP_ASSIGN_ROLE_LABEL_KEY)
+    selector = labels.get(OMP_ASSIGN_MODEL_LABEL_KEY)
+    if not fresh or not role or not selector:
+        return False
+    from omnigent.omp_config import OmpConfigError, OmpValidationError
+
+    try:
+        persist(profile, role, selector)
+    except (OmpConfigError, OmpValidationError) as exc:
+        _logger.warning("omp-native: could not assign %s to OMP role %r: %s", selector, role, exc)
+        return False
+    _logger.info("omp-native: assigned %s to OMP role %r", selector, role)
+    return True
+
+
+def _omp_terminal_launch_args(
+    raw_args: list[str], model_override: str | None
+) -> tuple[str | None, list[str]]:
+    """
+    Split persisted OMP launch args into the profile and bridge passthrough args.
+
+    ``--profile`` is pulled out so the bridge can place it before ``--mode rpc``.
+    The session's picked model is appended as ``--model=`` unless the launch
+    args already pin a model.
+
+    :param raw_args: Persisted terminal launch args, e.g. ``["--profile", "work"]``.
+    :param model_override: Persisted model, e.g. ``"ollama/glm-5.1:cloud"``.
+    :returns: ``(profile, passthrough_args)``.
+    """
+    profile: str | None = None
+    passthrough: list[str] = []
+    skip_next = False
+    for i, arg in enumerate(raw_args):
+        if skip_next:
+            skip_next = False
+            continue
+        if arg == "--profile" and i + 1 < len(raw_args):
+            profile = raw_args[i + 1]
+            skip_next = True
+        else:
+            passthrough.append(arg)
+    pins_model = any(arg == "--model" or arg.startswith("--model=") for arg in passthrough)
+    if model_override and not pins_model:
+        passthrough.append(f"--model={model_override}")
+    return profile, passthrough
+
+
+_omp_background_tasks: set[asyncio.Task[None]] = set()
+
+
+async def _persist_omp_session_file_metadata(
+    server_client: httpx.AsyncClient,
+    session_id: str,
+    bridge_dir: Path,
+    *,
+    timeout_s: float = 60.0,
+    poll_interval_s: float = 0.5,
+) -> None:
+    """Mirror the bridge-captured sessionFile onto the session as ``external_session_id``.
+
+    The session file outlives runner and bridge-dir loss, so a relaunch reads this
+    back and resumes with ``omp --resume <sessionFile>`` instead of cold-starting.
+    Best-effort, mirroring :func:`_persist_qwen_external_session_id`: a failure
+    only degrades that recovery path, never the live session.
+
+    :param server_client: Runner Omnigent server client.
+    :param session_id: Session/conversation identifier.
+    :param bridge_dir: Per-session bridge directory whose ``state.json`` the
+        bridge writes when OMP reports its ``sessionFile``.
+    :param timeout_s: How long to wait for the capture before giving up.
+    :param poll_interval_s: Delay between capture checks.
+    :returns: ``None``.
+    """
+    from omnigent.omp_native_bridge import OmpRpcBridge
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_s
+    session_file = OmpRpcBridge.stored_session_file(bridge_dir)
+    while session_file is None and loop.time() < deadline:
+        await asyncio.sleep(poll_interval_s)
+        session_file = OmpRpcBridge.stored_session_file(bridge_dir)
+    if session_file is None:
+        _logger.warning(
+            "omp-native: no sessionFile captured for %s within %.0fs; a relaunch "
+            "after losing the bridge dir will start fresh",
+            session_id,
+            timeout_s,
+        )
+        return
+    try:
+        resp = await server_client.patch(
+            f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
+            json={"external_session_id": str(session_file)},
+            timeout=10.0,
+        )
+    except (httpx.HTTPError, RuntimeError, ValueError):
+        _logger.warning(
+            "Could not record omp-native sessionFile for %s; a relaunch after "
+            "losing the bridge dir will start fresh",
+            session_id,
+            exc_info=True,
+        )
+        return
+    if resp.status_code >= 400:
+        _logger.warning(
+            "AP rejected omp-native sessionFile PATCH (%s); session=%s path=%s",
+            resp.status_code,
+            session_id,
+            session_file,
+        )
+
+
+async def _auto_create_omp_terminal(
+    session_id: str,
+    resource_registry: SessionResourceRegistry,
+    publish_event: Callable[[str, _JsonObject], None],
+    *,
+    server_client: httpx.AsyncClient | None,
+    agent_spec: AgentSpec | ResolvedSpec | None = None,
+) -> SessionResourceView:
+    """
+    Auto-create the OMP TUI terminal for an omp-native session.
+
+    The runner-owned terminal launches the per-session OMP RPC bridge in the
+    background and then execs the socket-only terminal client.  The bridge is
+    the sole owner of the ``omp --mode rpc`` subprocess; the terminal client
+    only renders bridge events and forwards terminal input.
+
+    :param session_id: Session/conversation identifier.
+    :param resource_registry: Session resource registry for launching the
+        terminal.
+    :param publish_event: Runner session event publisher.
+    :param server_client: Runner Omnigent server client.
+    :param agent_spec: The session's resolved agent spec, used for sandbox
+        inheritance.
+    :returns: Created terminal resource view.
+    """
+    from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
+    from omnigent.inner.omp_executor import resolve_omp_executable
+    from omnigent.omp_native import omp_native_terminal_command
+    from omnigent.omp_native_bridge import (
+        OmpRpcBridge,
+        _validate_session_file,
+        bridge_dir_for_session_id,
+    )
+    from omnigent.runner.resource_registry import OMP_NATIVE_TERMINAL_ROLE
+
+    launch_config = await _pi_native_launch_config(
+        session_id=session_id,
+        server_client=server_client,
+    )
+    workspace = str(launch_config.workspace)
+    bridge_dir = bridge_dir_for_session_id(session_id)
+
+    # The bridge's captured state file is authoritative for resume; fall back to
+    # the generic external_session_id only when the bridge state is absent.
+    session_file: Path | None = OmpRpcBridge.stored_session_file(bridge_dir)
+    if session_file is None and launch_config.external_session_id is not None:
+        session_file = Path(launch_config.external_session_id)
+    if session_file is not None:
+        # Refuse to cold-start over missing durable state: launching without the
+        # resume file would silently discard the user's OMP history.
+        session_file = _validate_session_file(session_file)
+
+    try:
+        omp_command = resolve_omp_executable()
+    except OSError as exc:
+        raise RuntimeError(f"Cannot launch omp-native terminal: {exc}") from exc
+
+    profile, passthrough = _omp_terminal_launch_args(
+        list(launch_config.terminal_launch_args or ()), launch_config.model_override
+    )
+
+    from omnigent.omp_config import persist_omp_role
+
+    await asyncio.to_thread(
+        _apply_omp_role_assignment,
+        launch_config.labels,
+        profile,
+        fresh=session_file is None,
+        persist=persist_omp_role,
+    )
+
+    command, args = omp_native_terminal_command(
+        session_id=session_id,
+        bridge_dir=bridge_dir,
+        workspace=Path(workspace),
+        executable=omp_command,
+        profile=profile,
+        extra_args=passthrough,
+        session_file=session_file,
+    )
+
+    agent_os_env = _agent_os_env_from_spec(agent_spec)
+    terminal_view = await resource_registry.launch_required_terminal(
+        session_id=session_id,
+        terminal_name="omp",
+        session_key="main",
+        resource_role=OMP_NATIVE_TERMINAL_ROLE,
+        parent_os_env=agent_os_env,
+        spec=TerminalEnvSpec(
+            os_env=OSEnvSpec(
+                type="caller_process",
+                cwd=workspace,
+                sandbox=(agent_os_env.sandbox if agent_os_env is not None else None),
+            ),
+            command=command,
+            args=args,
+            env={},
+            scrollback=100_000,
+            tmux_allow_passthrough=True,
+            tmux_start_on_attach=False,
+        ),
+    )
+    publish_event(
+        session_id,
+        {
+            "type": "session.resource.created",
+            "resource": session_resource_view_to_dict(terminal_view),
+        },
+    )
+    if server_client is not None:
+        task = asyncio.create_task(
+            _persist_omp_session_file_metadata(server_client, session_id, bridge_dir),
+            name=f"omp-native-session-file-{session_id}",
+        )
+        _omp_background_tasks.add(task)
+        task.add_done_callback(_omp_background_tasks.discard)
+    _logger.info(
+        "Auto-created omp terminal for session %s (bridge_dir=%s, session_file=%s)",
+        session_id,
+        bridge_dir,
+        session_file,
+    )
+    return terminal_view
 
 
 async def _auto_create_cursor_terminal(
@@ -6860,7 +7127,7 @@ async def _delete_native_bridge_dirs(
     holding a bridge token / auth secret + MCP config — secret material. Closing
     the pane does not remove it, so without this they accumulate even on a clean
     session delete (issue #1350). We don't know which harness this session used,
-    so delete every candidate dir for all 11 native families
+    so delete every candidate dir for all 12 native families
     (antigravity/claude/codex/cursor/goose/hermes/kimi/kiro/opencode/pi/qwen);
     the per-target ``FileNotFoundError`` swallow makes wrong-harness / already-gone
     cases a no-op, while other ``OSError``s are logged at debug rather than hidden.
@@ -6905,6 +7172,9 @@ async def _delete_native_bridge_dirs(
     from omnigent.kiro_native_bridge import (
         bridge_dir_for_session_id as kiro_bridge_dir,
     )
+    from omnigent.omp_native_bridge import (
+        bridge_dir_for_session_id as omp_bridge_dir,
+    )
     from omnigent.opencode_native_bridge import (
         OPENCODE_NATIVE_BRIDGE_ID_LABEL_KEY,
     )
@@ -6939,6 +7209,7 @@ async def _delete_native_bridge_dirs(
         kiro_bridge_dir(session_id),
         opencode_bridge_dir(labels.get(OPENCODE_NATIVE_BRIDGE_ID_LABEL_KEY) or session_id),
         opencode_bridge_dir(session_id),
+        omp_bridge_dir(session_id),
         pi_bridge_dir(session_id),
         qwen_bridge_dir(session_id),
     }
@@ -7141,6 +7412,17 @@ async def _launch_pi(ctx: NativeLaunchContext) -> SessionResourceView:
         server_client=ctx.server_client,
         agent_spec=ctx.agent_spec,
         ensure_comment_relay=ctx.ensure_comment_relay,
+    )
+
+
+async def _launch_omp(ctx: NativeLaunchContext) -> SessionResourceView:
+    """Adapter: build the omp-native terminal from a launch context."""
+    return await _auto_create_omp_terminal(
+        ctx.session_id,
+        ctx.resource_registry,
+        ctx.publish_event,
+        server_client=ctx.server_client,
+        agent_spec=ctx.agent_spec,
     )
 
 

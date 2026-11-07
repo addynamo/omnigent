@@ -3666,8 +3666,10 @@ async def _dispatch_model_send(
     monkeypatch: pytest.MonkeyPatch,
     *,
     agent_spec: Any,
-    model: str,
+    model: str | None,
     conv_id: str,
+    agent: str = "worker",
+    purpose: str | None = None,
 ) -> _ModelSendResult:
     """
     Drive one fresh-create ``sys_session_send`` carrying ``args.model``.
@@ -3709,9 +3711,13 @@ async def _dispatch_model_send(
                 tool_name="sys_session_send",
                 arguments=json.dumps(
                     {
-                        "agent": "worker",
+                        "agent": agent,
                         "title": "task",
-                        "args": {"input": "do the task", "model": model},
+                        "args": {
+                            "input": "do the task",
+                            **({"model": model} if model is not None else {}),
+                            **({"purpose": purpose} if purpose is not None else {}),
+                        },
                     }
                 ),
                 server_client=server_client,
@@ -9743,3 +9749,133 @@ async def test_factor3_new_message_lands_in_real_buffer(
     assert buffered
     assert buffered[-1]["content"] == "second message"
     assert buffered[-1]["conversation_id"] == conv
+
+
+def _polly_spec_with_omp_worker(name: str = "polly") -> AgentSpec:
+    """
+    Build a parent spec whose ``omp`` sub-agent runs the omp harness.
+
+    :param name: The parent agent's name, e.g. ``"polly"``.
+    :returns: The parent spec.
+    """
+    return AgentSpec(
+        spec_version=1,
+        name=name,
+        sub_agents=[
+            AgentSpec(
+                spec_version=1,
+                name="omp",
+                executor=ExecutorSpec(type="omnigent", config={"harness": "omp"}),
+            )
+        ],
+    )
+
+
+def _isolate_review_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, review_model: str | None
+) -> None:
+    """
+    Isolate config with an optional ``polly_review_model`` and a present ``omp`` CLI.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp dir holding ``config.yaml``.
+    :param review_model: The configured review model, or ``None`` for unset.
+    """
+    yaml_text = f"polly_review_model: {review_model!r}\n" if review_model is not None else ""
+    _isolate_model_providers(monkeypatch, tmp_path, yaml_text)
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_install.missing_harness_cli", lambda _harness: None
+    )
+
+
+@pytest.mark.asyncio
+async def test_polly_review_dispatch_uses_configured_review_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A polly review sent to ``omp`` without a model runs on ``polly_review_model``."""
+    _isolate_review_model(monkeypatch, tmp_path, "ollama/minimax-m3:cloud")
+    result = await _dispatch_model_send(
+        monkeypatch,
+        agent_spec=_polly_spec_with_omp_worker(),
+        model=None,
+        conv_id="conv_polly_review_cfg",
+        agent="omp",
+        purpose="review",
+    )
+    assert json.loads(result.output)["status"] == "launching"
+    assert result.create_bodies[0]["model_override"] == "ollama/minimax-m3:cloud"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("parent", "purpose", "model", "expected"),
+    [
+        pytest.param(
+            "polly",
+            "review",
+            "ollama/glm-5.1:cloud",
+            "ollama/glm-5.1:cloud",
+            id="explicit-model-wins",
+        ),
+        pytest.param("polly", "implement", None, None, id="implement-untouched"),
+        pytest.param("polly", None, None, None, id="no-purpose-untouched"),
+        pytest.param("other", "review", None, None, id="non-polly-untouched"),
+    ],
+)
+async def test_polly_review_model_applies_only_to_unpinned_polly_reviews(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    parent: str,
+    purpose: str | None,
+    model: str | None,
+    expected: str | None,
+) -> None:
+    """Only polly's ``review`` dispatches without an explicit model get the configured one."""
+    _isolate_review_model(monkeypatch, tmp_path, "ollama/minimax-m3:cloud")
+    result = await _dispatch_model_send(
+        monkeypatch,
+        agent_spec=_polly_spec_with_omp_worker(parent),
+        model=model,
+        conv_id=f"conv_polly_review_{parent}_{purpose}_{model}",
+        agent="omp",
+        purpose=purpose,
+    )
+    assert json.loads(result.output)["status"] == "launching"
+    assert result.create_bodies[0].get("model_override") == expected
+
+
+@pytest.mark.asyncio
+async def test_polly_review_without_configured_model_runs_omp_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """With no ``polly_review_model`` set, the review runs on OMP's own default."""
+    _isolate_review_model(monkeypatch, tmp_path, None)
+    result = await _dispatch_model_send(
+        monkeypatch,
+        agent_spec=_polly_spec_with_omp_worker(),
+        model=None,
+        conv_id="conv_polly_review_unset",
+        agent="omp",
+        purpose="review",
+    )
+    assert json.loads(result.output)["status"] == "launching"
+    assert "model_override" not in result.create_bodies[0]
+
+
+@pytest.mark.asyncio
+async def test_polly_review_with_invalid_configured_model_fails_loud(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A bad ``polly_review_model`` is reported instead of silently ignored."""
+    _isolate_review_model(monkeypatch, tmp_path, "--evil")
+    result = await _dispatch_model_send(
+        monkeypatch,
+        agent_spec=_polly_spec_with_omp_worker(),
+        model=None,
+        conv_id="conv_polly_review_bad",
+        agent="omp",
+        purpose="review",
+    )
+    assert result.output.startswith("Error:")
+    assert "polly_review_model" in result.output
+    assert result.create_bodies == []

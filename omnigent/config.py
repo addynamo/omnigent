@@ -32,6 +32,23 @@ def load_global_config(path: Path | None = None) -> _Config:
         return raw
 
 
+#: User-level config key naming the model polly's ``omp`` reviews run on.
+POLLY_REVIEW_MODEL_CONFIG_KEY = "polly_review_model"
+
+
+def polly_review_model(path: Path | None = None) -> str | None:
+    """
+    Return the user's configured polly review model, or ``None`` when unset.
+
+    :param path: Config file to read; defaults to the user-level config.
+    :returns: The raw configured value, e.g. ``"ollama/minimax-m3:cloud"``.
+    """
+    value = load_global_config(path).get(POLLY_REVIEW_MODEL_CONFIG_KEY)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
 def load_local_config(path: Path | None = None) -> _Config:
     """Load the project-level config, returning an empty mapping when absent."""
     resolved_path = path or Path.cwd() / _LOCAL_CONFIG_RELPATH

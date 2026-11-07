@@ -23,6 +23,7 @@ from omnigent._wrapper_labels import (
     HERMES_NATIVE_WRAPPER_VALUE,
     KIMI_NATIVE_WRAPPER_VALUE,
     KIRO_NATIVE_WRAPPER_VALUE,
+    OMP_NATIVE_WRAPPER_VALUE,
     OPENCODE_NATIVE_WRAPPER_VALUE,
     PI_NATIVE_WRAPPER_VALUE,
     QWEN_NATIVE_WRAPPER_VALUE,
@@ -242,6 +243,15 @@ HERMES_NATIVE_CODING_AGENT = NativeCodingAgent(
     terminal_name="hermes",
 )
 
+OMP_NATIVE_CODING_AGENT = NativeCodingAgent(
+    key="omp",
+    display_name="OMP",
+    agent_name="omp-native-ui",
+    harness="omp-native",
+    wrapper_label=OMP_NATIVE_WRAPPER_VALUE,
+    terminal_name="omp",
+)
+
 
 # Native harnesses whose spawn-env builder takes a ``bridge_id=`` resolved from
 # a session label. Their label key follows the uniform
@@ -293,6 +303,7 @@ _BUILTIN_NATIVE_PROVIDERS: tuple[NativeHarnessProvider, ...] = tuple(
         QWEN_NATIVE_CODING_AGENT,
         KIMI_NATIVE_CODING_AGENT,
         HERMES_NATIVE_CODING_AGENT,
+        OMP_NATIVE_CODING_AGENT,
     )
 )
 
@@ -488,6 +499,20 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         shell_tool_name="terminal",
         shell_tool_prompt=_SHELL_PROMPT,
     ),
+    "omp-native": _C(
+        _IM.NATIVE_TUI,
+        _EL.JSONRPC,
+        _RS.WARM_REATTACH,
+        _EF.NONE,
+        _MF.MULTI,
+        _AU.SESSION_SCOPED_CONFIG,
+        subagents=False,
+        interrupt=True,
+        streaming=True,
+        fork_history=_FH.REBUILD,
+        shell_tool_name="Bash",
+        shell_tool_prompt=_BASH_PROMPT,
+    ),
     # SDK / subprocess harnesses (run the vendor model directly). The first four
     # are bench-verified interrupt=streaming=True.
     "claude-sdk": _C(
@@ -519,6 +544,17 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         _EF.NONE,
         _MF.MULTI,
         _AU.OMNIGENT_CREDENTIAL,
+        subagents=False,
+        interrupt=True,
+        streaming=True,
+    ),
+    "omp": _C(
+        _IM.CLI_SUBPROCESS,
+        _EL.NONE,
+        _RS.COLD_ONLY,
+        _EF.NONE,
+        _MF.MULTI,
+        _AU.SESSION_SCOPED_CONFIG,
         subagents=False,
         interrupt=True,
         streaming=True,
@@ -671,6 +707,8 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
             "kimi-native",
             "kiro-native",
             "open-responses",
+            "omp",
+            "omp-native",
             "openai-agents",
             "opencode-native",
             "pi",
@@ -702,6 +740,8 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "kimi": "omnigent.inner.kimi_harness",
         "kimi-native": "omnigent.inner.kimi_native_harness",
         "kiro-native": "omnigent.inner.kiro_native_harness",
+        "omp": "omnigent.inner.omp_harness",
+        "omp-native": "omnigent.inner.omp_native_harness",
         "openai-agents": "omnigent.inner.openai_agents_sdk_harness",
         "opencode-native": "omnigent.inner.opencode_native_harness",
         "pi": "omnigent.inner.pi_harness",
@@ -722,6 +762,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "native-kimi": "kimi-native",
         "native-kiro": "kiro-native",
         "native-opencode": "opencode-native",
+        "native-omp": "omp-native",
         "native-pi": "pi-native",
         "native-qwen": "qwen-native",
         "opencode": "opencode-native",
@@ -747,8 +788,10 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
             "native-kimi",
             "native-kiro",
             "native-opencode",
+            "native-omp",
             "native-pi",
             "native-qwen",
+            "omp-native",
             "opencode-native",
             "pi-native",
             "qwen-native",
@@ -766,6 +809,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         QWEN_NATIVE_CODING_AGENT,
         KIMI_NATIVE_CODING_AGENT,
         HERMES_NATIVE_CODING_AGENT,
+        OMP_NATIVE_CODING_AGENT,
     ),
     native_providers=_BUILTIN_NATIVE_PROVIDERS,
     # Catalog rows gate readiness on their vendor binary; the install spec also
@@ -786,9 +830,13 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "goose": "HARNESS_GOOSE_MODEL",
         "hermes": "HARNESS_HERMES_MODEL",
         "kimi": "HARNESS_KIMI_MODEL",
+        "omp": "HARNESS_OMP_MODEL",
         "openai-agents": "HARNESS_OPENAI_AGENTS_MODEL",
         "pi": "HARNESS_PI_MODEL",
         "qwen": "HARNESS_QWEN_MODEL",
+    },
+    spawn_env_builders={
+        "omp": "omnigent.runtime.workflow:_build_omp_spawn_env",
     },
     background_title_generators={
         "claude-sdk": BackgroundTitleGeneratorSpec(
@@ -816,6 +864,8 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         # stays a valid harness for YAML specs (and the credential-free
         # integration mock LLM), but is no longer offered as a UI pick.
         "pi": "Pi",
+        "omp": "OMP",
+        "omp-native": "OMP Native",
         **{name: row.label for name, row in ACP_CLI_HARNESSES.items()},
     },
     capabilities=_BUILTIN_CAPABILITIES,
