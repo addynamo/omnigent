@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import shlex
+import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -200,9 +201,14 @@ def omp_native_terminal_command(
         bridge_args.append(f"--extra-arg={arg}")
     if session_file is not None:
         bridge_args.extend(["--resume", str(session_file)])
-    bridge_command = " ".join(shlex.quote(part) for part in ["python", *bridge_args])
+    # The runner's interpreter, never a PATH-resolved ``python``: the pane's
+    # login shell may not resolve ``python`` at all. ``-I`` keeps the pane cwd
+    # off sys.path so a workspace checkout can't shadow the installed package.
+    python = sys.executable
+    bridge_command = " ".join(shlex.quote(part) for part in [python, "-I", *bridge_args])
     terminal_args = [
-        "python",
+        python,
+        "-I",
         "-m",
         "omnigent.omp_native_terminal",
         "--bridge-dir",

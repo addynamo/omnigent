@@ -56,7 +56,8 @@ def test_terminal_command_forwards_flag_extra_args_to_bridge(
         extra_args=["--model=openrouter/ai21/jamba-large-1.7"],
     )
     bridge_command = args[1].split(" & exec ", 1)[0]
-    bridge_argv = shlex.split(bridge_command)[3:]  # drop: python -m omnigent.omp_native_bridge
+    bridge_argv = shlex.split(bridge_command)
+    bridge_argv = bridge_argv[bridge_argv.index("serve") :]  # drop interpreter prefix
 
     captured: dict[str, object] = {}
 
@@ -67,6 +68,26 @@ def test_terminal_command_forwards_flag_extra_args_to_bridge(
     omp_native_bridge.main(bridge_argv)
 
     assert captured["extra_arg"] == ["--model=openrouter/ai21/jamba-large-1.7"]
+
+
+def test_terminal_command_uses_runner_interpreter(tmp_path: Path) -> None:
+    """Both pane processes run the runner's interpreter, not a PATH ``python``."""
+    import shlex
+    import sys
+
+    from omnigent.omp_native import omp_native_terminal_command
+
+    _, args = omp_native_terminal_command(
+        session_id="s1",
+        bridge_dir=tmp_path,
+        workspace=tmp_path,
+        executable="omp",
+    )
+    bridge_command, terminal_command = args[1].split(" & exec ", 1)
+    for command in (bridge_command, terminal_command):
+        argv = shlex.split(command)
+        assert argv[0] == sys.executable
+        assert "-I" in argv
 
 
 @pytest.mark.parametrize(
